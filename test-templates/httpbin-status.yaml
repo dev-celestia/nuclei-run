@@ -1,0 +1,16 @@
+id: httpbin-status-check
+info:
+  name: HTTPBin Status Check
+  author: nuclei-rs-test
+  severity: info
+  description: Verifies that httpbin returns a 200 status code
+  tags: test,httpbin
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/get"
+    matchers:
+      - type: status
+        status:
+          - 200

@@ -1,0 +1,23 @@
+id: httpbin-regex-extract
+info:
+  name: HTTPBin Regex Extractor
+  author: nuclei-rs-test
+  severity: medium
+  description: Extracts the User-Agent from httpbin response
+  tags: test,httpbin,extractor
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/user-agent"
+    matchers:
+      - type: status
+        status:
+          - 200
+    extractors:
+      - type: regex
+        name: user_agent
+        part: body
+        regex:
+          - '"user-agent":\s*"([^"]+)"'
+        group: 1

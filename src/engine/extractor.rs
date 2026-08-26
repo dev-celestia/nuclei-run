@@ -1,0 +1,271 @@
+use crate::engine::http_client::HttpResponse;
+use crate::models::template::TemplateExtractor;
+use regex::Regex;
+use std::collections::HashMap;
+
+/// Extractor engine that pulls values from HTTP responses.
+/// Supports regex (with capture groups), kval (header key-value), and json (dot-path).
+pub struct ExtractorEngine;
+
+impl ExtractorEngine {
+    /// Run a single extractor against the response and return extracted values.
+    /// Returns a map of `name -> extracted_value` for chaining into subsequent requests.
+    pub fn extract(
+        extractor: &TemplateExtractor,
+        response: &HttpResponse,
+    ) -> HashMap<String, String> {
+        let mut results = HashMap::new();
+        let name = extractor
+            .name
+            .clone()
+            .unwrap_or_else(|| extractor.extractor_type.clone());
+
+        match extractor.extractor_type.as_str() {
+            "regex" => {
+                let content = Self::get_content(extractor, response);
+                if let Some(value) = Self::extract_regex(
+                    &extractor.regex,
+                    &content,
+                    extractor.regex_group.unwrap_or(0),
+                ) {
+                    results.insert(name, value);
+                }
+            }
+            "kval" => {
+                for key in &extractor.kval {
+                    let lower_key = key.to_lowercase();
+                    if let Some(value) = response.headers_map.get(&lower_key) {
+                        let kval_name = if extractor.kval.len() == 1 {
+                            name.clone()
+                        } else {
+                            key.clone()
+                        };
+                        results.insert(kval_name, value.clone());
+                    }
+                }
+            }
+            "json" => {
+                let content = Self::get_content(extractor, response);
+                for path in &extractor.json {
+                    if let Some(value) = Self::extract_json_path(&content, path) {
+                        let json_name = if extractor.json.len() == 1 {
+                            name.clone()
+                        } else {
+                            path.clone()
+                        };
+                        results.insert(json_name, value);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        results
+    }
+
+    /// Run all extractors and merge results.
+    /// Internal extractors are included (for chaining) but can be filtered at output.
+    pub fn extract_all(
+        extractors: &[TemplateExtractor],
+        response: &HttpResponse,
+    ) -> HashMap<String, String> {
+        let mut all_results = HashMap::new();
+        for ext in extractors {
+            let extracted = Self::extract(ext, response);
+            all_results.extend(extracted);
+        }
+        all_results
+    }
+
+    /// Get non-internal extracted values (for output display).
+    pub fn extract_output_values(
+        extractors: &[TemplateExtractor],
+        response: &HttpResponse,
+    ) -> Vec<String> {
+        let mut values = Vec::new();
+        for ext in extractors {
+            if ext.internal {
+                continue; // Skip internal extractors from output.
+            }
+            let extracted = Self::extract(ext, response);
+            for (_, v) in extracted {
+                if !v.is_empty() {
+                    values.push(v);
+                }
+            }
+        }
+        values
+    }
+
+    // -----------------------------------------------------------------------
+    // Regex Extraction
+    // -----------------------------------------------------------------------
+
+    fn extract_regex(patterns: &[String], text: &str, group: usize) -> Option<String> {
+        for pat in patterns {
+            if let Ok(re) = Regex::new(pat) {
+                if let Some(caps) = re.captures(text) {
+                    // Try to get the specified capture group, fall back to full match.
+                    if let Some(m) = caps.get(group) {
+                        return Some(m.as_str().to_string());
+                    } else if let Some(m) = caps.get(0) {
+                        return Some(m.as_str().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON Path Extraction (basic dot-notation)
+    // -----------------------------------------------------------------------
+
+    fn extract_json_path(json_text: &str, path: &str) -> Option<String> {
+        let parsed: serde_json::Value = serde_json::from_str(json_text).ok()?;
+
+        let mut current = &parsed;
+        for key in path.trim_start_matches('.').split('.') {
+            // Handle array indexing: key[0]
+            if let Some(bracket_pos) = key.find('[') {
+                let field = &key[..bracket_pos];
+                let index_str = &key[bracket_pos + 1..key.len() - 1];
+                let index: usize = index_str.parse().ok()?;
+
+                if !field.is_empty() {
+                    current = current.get(field)?;
+                }
+                current = current.get(index)?;
+            } else {
+                current = current.get(key)?;
+            }
+        }
+
+        Some(match current {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => "null".to_string(),
+            other => other.to_string(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Content Selection
+    // -----------------------------------------------------------------------
+
+    fn get_content(extractor: &TemplateExtractor, response: &HttpResponse) -> String {
+        match extractor.part.as_deref().unwrap_or("body") {
+            "header" | "all_headers" => response.headers_raw.clone(),
+            "response" => format!("{}\n{}", response.headers_raw, response.body),
+            _ => response.body.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_response() -> HttpResponse {
+        let mut headers_map = HashMap::new();
+        headers_map.insert("content-type".to_string(), "application/json".to_string());
+        headers_map.insert("x-powered-by".to_string(), "Express".to_string());
+
+        HttpResponse {
+            status: 200,
+            headers_raw: "content-type: application/json\nx-powered-by: Express\n".to_string(),
+            body: r#"{"user": "admin", "role": "superuser", "tokens": ["abc", "def"]}"#
+                .to_string(),
+            headers_map,
+        }
+    }
+
+    #[test]
+    fn test_regex_extractor() {
+        let ext = TemplateExtractor {
+            extractor_type: "regex".to_string(),
+            name: Some("version".to_string()),
+            part: Some("body".to_string()),
+            regex: vec![r#""user":\s*"([^"]+)""#.to_string()],
+            regex_group: Some(1),
+            kval: vec![],
+            json: vec![],
+            internal: false,
+        };
+
+        let resp = make_response();
+        let result = ExtractorEngine::extract(&ext, &resp);
+        assert_eq!(result.get("version"), Some(&"admin".to_string()));
+    }
+
+    #[test]
+    fn test_kval_extractor() {
+        let ext = TemplateExtractor {
+            extractor_type: "kval".to_string(),
+            name: Some("server_tech".to_string()),
+            part: None,
+            regex: vec![],
+            regex_group: None,
+            kval: vec!["x-powered-by".to_string()],
+            json: vec![],
+            internal: false,
+        };
+
+        let resp = make_response();
+        let result = ExtractorEngine::extract(&ext, &resp);
+        assert_eq!(result.get("server_tech"), Some(&"Express".to_string()));
+    }
+
+    #[test]
+    fn test_json_extractor() {
+        let ext = TemplateExtractor {
+            extractor_type: "json".to_string(),
+            name: Some("user_role".to_string()),
+            part: None,
+            regex: vec![],
+            regex_group: None,
+            kval: vec![],
+            json: vec![".role".to_string()],
+            internal: false,
+        };
+
+        let resp = make_response();
+        let result = ExtractorEngine::extract(&ext, &resp);
+        assert_eq!(result.get("user_role"), Some(&"superuser".to_string()));
+    }
+
+    #[test]
+    fn test_json_array_extractor() {
+        let ext = TemplateExtractor {
+            extractor_type: "json".to_string(),
+            name: Some("first_token".to_string()),
+            part: None,
+            regex: vec![],
+            regex_group: None,
+            kval: vec![],
+            json: vec![".tokens[0]".to_string()],
+            internal: false,
+        };
+
+        let resp = make_response();
+        let result = ExtractorEngine::extract(&ext, &resp);
+        assert_eq!(result.get("first_token"), Some(&"abc".to_string()));
+    }
+
+    #[test]
+    fn test_internal_extractor_excluded_from_output() {
+        let ext = TemplateExtractor {
+            extractor_type: "regex".to_string(),
+            name: Some("internal_token".to_string()),
+            part: Some("body".to_string()),
+            regex: vec![r#""user":\s*"([^"]+)""#.to_string()],
+            regex_group: Some(1),
+            kval: vec![],
+            json: vec![],
+            internal: true, // Should NOT appear in output values.
+        };
+
+        let resp = make_response();
+        let output = ExtractorEngine::extract_output_values(&[ext], &resp);
+        assert!(output.is_empty());
+    }
+}

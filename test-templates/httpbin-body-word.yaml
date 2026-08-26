@@ -1,0 +1,23 @@
+id: httpbin-body-word
+info:
+  name: HTTPBin Body Word Match
+  author: nuclei-rs-test
+  severity: low
+  description: Checks that httpbin returns JSON with expected keys
+  tags: test,httpbin
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/get"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - '"url"'
+          - '"headers"'
+        condition: and

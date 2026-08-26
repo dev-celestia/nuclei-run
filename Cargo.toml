@@ -1,0 +1,51 @@
+[package]
+name = "nuclei-rs"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Nuclei-compatible vulnerability scanner"
+
+[[bin]]
+name = "nuclei-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Async Runtime & Networking
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "gzip", "json", "socks"] }
+governor = "0.8"
+nonzero_ext = "0.3"
+
+# Serialization & Template Parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+
+# Fast Pattern Matching
+aho-corasick = "1.1"
+regex = "1.10"
+
+# CLI & Output Formatting
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+url = "2"
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# DSL Helpers
+md-5 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+# Concurrency
+async-channel = "2"
+async-trait = "0.1"
+
+# Misc
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
