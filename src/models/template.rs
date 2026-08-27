@@ -86,6 +86,7 @@ impl Default for FlexibleStringList {
 }
 
 impl FlexibleStringList {
+    #[allow(dead_code)]
     pub fn as_vec(&self) -> Vec<String> {
         match self {
             FlexibleStringList::Single(s) => {

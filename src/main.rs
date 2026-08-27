@@ -15,9 +15,9 @@ use parser::yaml_loader::{self, TemplateFilter};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// nuclei-rs: High-performance Nuclei-compatible vulnerability scanner
+/// nuclei-run: High-performance Nuclei-compatible vulnerability scanner
 #[derive(Parser, Debug)]
-#[command(name = "nuclei-rs", version, about = "High-performance Nuclei-compatible vulnerability scanner")]
+#[command(name = "nuclei-run", version, about = "High-performance Nuclei-compatible vulnerability scanner")]
 struct Cli {
     /// Target URL to scan
     #[arg(short = 'u', long = "url")]

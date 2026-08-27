@@ -1,5 +1,6 @@
 /// Runtime configuration derived from CLI arguments.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ScanConfig {
     /// Target URLs to scan.
     pub targets: Vec<String>,

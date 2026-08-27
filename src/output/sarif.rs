@@ -85,9 +85,9 @@ impl SarifReporter {
             "runs": [{
                 "tool": {
                     "driver": {
-                        "name": "nuclei-rs",
+                        "name": "nuclei-run",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "informationUri": "https://github.com/nuclei-rs",
+                        "informationUri": "https://github.com/dev-celestia/nuclei-run",
                         "rules": rules
                     }
                 },

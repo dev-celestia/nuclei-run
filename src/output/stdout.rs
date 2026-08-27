@@ -25,18 +25,18 @@ pub fn print_finding(finding: &ScanFinding) {
 /// Print the scan banner at startup.
 pub fn print_banner() {
     let banner = r#"
-                    __     _                    
-   ____  __  ______/ /__  (_)     __________    
-  / __ \/ / / / __/ / _ \/ /_____/ ___/ ___/    
- / / / / /_/ / /_/ /  __/ /_____/ /  (__  )     
-/_/ /_/\__,_/\__/_/\___/_/     /_/  /____/      
-                                                 
+                    __     _                             
+   ____  __  ______/ /__  (_)     _______  ______        
+  / __ \/ / / / __/ / _ \/ /_____/ ___/ / / / __ \       
+ / / / / /_/ / /_/ /  __/ /_____/ /  / /_/ / / / /       
+/_/ /_/\__,_/\__/_/\___/_/     /_/   \__,_/_/ /_/        
+                                                         
     "#;
 
     println!("{}", banner.bright_cyan());
     println!(
         "  {} {} | {}",
-        "nuclei-rs".bold().bright_white(),
+        "nuclei-run".bold().bright_white(),
         env!("CARGO_PKG_VERSION").dimmed(),
         "High-Performance Vulnerability Scanner".dimmed()
     );

@@ -1,7 +1,7 @@
 id: httpbin-status-check
 info:
   name: HTTPBin Status Check
-  author: nuclei-rs-test
+  author: nuclei-run-test
   severity: info
   description: Verifies that httpbin returns a 200 status code
   tags: test,httpbin

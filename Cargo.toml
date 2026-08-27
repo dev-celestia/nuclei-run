@@ -1,11 +1,17 @@
 [package]
-name = "nuclei-rs"
+name = "nuclei-run"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance Nuclei-compatible vulnerability scanner"
+license = "MIT"
+readme = "readme.md"
+repository = "https://github.com/dev-celestia/nuclei-run"
+homepage = "https://github.com/dev-celestia/nuclei-run"
+keywords = ["nuclei", "security", "scanner", "vulnerability", "templates"]
+categories = ["command-line-utilities", "development-tools::profiling"]
 
 [[bin]]
-name = "nuclei-rs"
+name = "nuclei-run"
 path = "src/main.rs"
 
 [dependencies]

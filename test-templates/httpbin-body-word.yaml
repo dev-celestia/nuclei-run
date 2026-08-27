@@ -1,7 +1,7 @@
 id: httpbin-body-word
 info:
   name: HTTPBin Body Word Match
-  author: nuclei-rs-test
+  author: nuclei-run-test
   severity: low
   description: Checks that httpbin returns JSON with expected keys
   tags: test,httpbin

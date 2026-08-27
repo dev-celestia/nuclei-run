@@ -38,6 +38,7 @@ impl VariableResolver {
     /// Resolve a raw path into a full URL using the target as context.
     /// If the path already starts with http:// or https://, resolve variables inline.
     /// Otherwise, join the path to the base URL.
+    #[allow(dead_code)]
     pub fn resolve_path(raw_path: &str, target_url: &str) -> Option<String> {
         let resolved = Self::resolve(raw_path, target_url);
 

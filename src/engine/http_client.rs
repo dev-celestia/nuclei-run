@@ -63,6 +63,7 @@ impl HttpClient {
     }
 
     /// Create a simple client with just a timeout (for basic usage).
+    #[allow(dead_code)]
     pub fn simple(timeout_secs: u64) -> Self {
         Self::new(timeout_secs, 10, None, &[])
     }

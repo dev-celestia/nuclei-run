@@ -50,6 +50,7 @@ impl EngineRunner {
     }
 
     /// Signal the engine to cancel all in-flight work.
+    #[allow(dead_code)]
     pub fn cancel(&self) {
         self.is_cancelled.store(true, Ordering::SeqCst);
     }

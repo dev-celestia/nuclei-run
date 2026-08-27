@@ -1,4 +1,4 @@
-# nuclei-rs
+# nuclei-run
 
 High-performance, Nuclei-compatible vulnerability scanner written in Rust. Parses and executes ProjectDiscovery Nuclei YAML templates with async I/O, SIMD-accelerated pattern matching, and structured output.
 
@@ -22,12 +22,12 @@ High-performance, Nuclei-compatible vulnerability scanner written in Rust. Parse
 ### Build from source
 
 ```bash
-git clone https://github.com/your-org/nuclei-rs.git
-cd nuclei-rs
+git clone https://github.com/dev-celestia/nuclei-run.git
+cd nuclei-run
 cargo build --release
 ```
 
-The binary is at `target/release/nuclei-rs`.
+The binary is at `target/release/nuclei-run`.
 
 ### Requirements
 
@@ -37,28 +37,28 @@ The binary is at `target/release/nuclei-rs`.
 
 ```bash
 # Scan a single target
-nuclei-rs -u https://target.com -t ./templates/
+nuclei-run -u https://target.com -t ./templates/
 
 # Scan with severity filter and rate limit
-nuclei-rs -u https://target.com -t ./cves/ -s high,critical -c 50 --rate-limit 150
+nuclei-run -u https://target.com -t ./cves/ -s high,critical -c 50 --rate-limit 150
 
 # Scan from a target list with JSONL output
-nuclei-rs -l targets.txt -t ./templates/ --jsonl -o results.jsonl
+nuclei-run -l targets.txt -t ./templates/ --jsonl -o results.jsonl
 
 # Generate SARIF report for CI/CD
-nuclei-rs -u https://staging.app -t ./templates/ --sarif -o results.sarif.json --silent
+nuclei-run -u https://staging.app -t ./templates/ --sarif -o results.sarif.json --silent
 
 # Pipe targets from stdin
-cat targets.txt | nuclei-rs -t ./templates/
+cat targets.txt | nuclei-run -t ./templates/
 
 # Custom headers and proxy
-nuclei-rs -u https://target.com -t ./templates/ -H "Authorization: Bearer token" --proxy socks5://127.0.0.1:1080
+nuclei-run -u https://target.com -t ./templates/ -H "Authorization: Bearer token" --proxy socks5://127.0.0.1:1080
 ```
 
 ## Usage
 
 ```
-nuclei-rs [OPTIONS] --templates <TEMPLATES>
+nuclei-run [OPTIONS] --templates <TEMPLATES>
 
 Options:
   -u, --url <URL>                      Target URL to scan
@@ -84,7 +84,7 @@ Options:
 
 ## Template Format
 
-nuclei-rs supports standard Nuclei HTTP templates:
+nuclei-run supports standard Nuclei HTTP templates:
 
 ```yaml
 id: example-cve-check
@@ -198,13 +198,13 @@ Generates a standards-compliant SARIF report compatible with GitHub Code Scannin
 
 ## CI/CD Integration
 
-nuclei-rs exits with code 1 when critical or high severity findings are detected, making it suitable as a pipeline gate:
+nuclei-run exits with code 1 when critical or high severity findings are detected, making it suitable as a pipeline gate:
 
 ```yaml
 # GitHub Actions example
 - name: Security Scan
   run: |
-    nuclei-rs -u ${{ env.STAGING_URL }} -t ./templates/ --sarif -o results.sarif.json --silent
+    nuclei-run -u ${{ env.STAGING_URL }} -t ./templates/ --sarif -o results.sarif.json --silent
 
 - name: Upload SARIF
   uses: github/codeql-action/upload-sarif@v3
@@ -217,7 +217,7 @@ nuclei-rs exits with code 1 when critical or high severity findings are detected
 The engine exposes a `UiScannerAdapter` trait for embedding into graphical frontends:
 
 ```rust
-use nuclei_rs::ui_bridge::{UiScannerAdapter, UiScanConfig, ScannerEvent, NucleiUiEngine};
+use nuclei_run::ui_bridge::{UiScannerAdapter, UiScanConfig, ScannerEvent, NucleiUiEngine};
 use tokio::sync::mpsc;
 
 let engine = NucleiUiEngine::new();
