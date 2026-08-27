@@ -43,6 +43,11 @@ impl MatcherEngine {
                 Self::match_binary(&matcher.binary, &content)
             }
             "dsl" => Self::match_dsl(&matcher.dsl, resp),
+            "size" => Self::match_size(&matcher.size, resp.body.len()),
+            "xpath" => {
+                let content = Self::get_part(matcher, resp);
+                Self::match_xpath(&matcher.xpath, &content)
+            }
             _ => false,
         };
 
@@ -174,6 +179,68 @@ impl MatcherEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Size Matcher
+    // -----------------------------------------------------------------------
+
+    fn match_size(expected_sizes: &[usize], actual_size: usize) -> bool {
+        if expected_sizes.is_empty() {
+            return false;
+        }
+        expected_sizes.contains(&actual_size)
+    }
+
+    // -----------------------------------------------------------------------
+    // XPath Matcher
+    // -----------------------------------------------------------------------
+
+    fn match_xpath(xpath_expressions: &[String], xml_content: &str) -> bool {
+        if xpath_expressions.is_empty() {
+            return false;
+        }
+
+        let package = match sxd_document::parser::parse(xml_content) {
+            Ok(pkg) => pkg,
+            Err(_) => return false,
+        };
+        let document = package.as_document();
+
+        for expr_str in xpath_expressions {
+            let factory = sxd_xpath::Factory::new();
+            if let Ok(xpath) = factory.build(expr_str) {
+                if let Some(xpath) = xpath {
+                    let context = sxd_xpath::Context::new();
+                    if let Ok(value) = xpath.evaluate(&context, document.root()) {
+                        match value {
+                            sxd_xpath::Value::Nodeset(nodes) => {
+                                if nodes.size() > 0 {
+                                    return true;
+                                }
+                            }
+                            sxd_xpath::Value::Boolean(b) => {
+                                if b {
+                                    return true;
+                                }
+                            }
+                            sxd_xpath::Value::String(s) => {
+                                if !s.is_empty() {
+                                    return true;
+                                }
+                            }
+                            sxd_xpath::Value::Number(n) => {
+                                if n != 0.0 && !n.is_nan() {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -255,11 +322,15 @@ mod tests {
             status: vec![],
             dsl: vec![],
             binary: vec![],
+            size: vec![],
+            xpath: vec![],
+            time: vec![],
             condition: None,
             negative: false,
             case_insensitive: false,
             encoding: None,
             name: None,
+            internal: false,
         }
     }
 
@@ -369,5 +440,59 @@ mod tests {
             body: "welcome admin",
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
+    }
+
+    #[test]
+    fn test_internal_matcher_deserialization() {
+        let yaml = r#"
+type: status
+status:
+  - 403
+  - 401
+internal: true
+"#;
+        let matcher: TemplateMatcher = serde_yaml::from_str(yaml).unwrap();
+        assert!(matcher.internal);
+        assert_eq!(matcher.status, vec![403, 401]);
+    }
+
+    #[test]
+    fn test_size_matcher() {
+        let mut m = make_matcher("size");
+        m.size = vec![12, 100];
+
+        let resp = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "Hello World!", // len = 12
+        };
+        assert!(MatcherEngine::evaluate(&m, &resp));
+
+        let resp_wrong = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "Wrong",
+        };
+        assert!(!MatcherEngine::evaluate(&m, &resp_wrong));
+    }
+
+    #[test]
+    fn test_xpath_matcher() {
+        let mut m = make_matcher("xpath");
+        m.xpath = vec!["//user[@role='admin']".to_string()];
+
+        let resp = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "<users><user role='admin'>Alice</user></users>",
+        };
+        assert!(MatcherEngine::evaluate(&m, &resp));
+
+        let resp_no_match = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "<users><user role='guest'>Bob</user></users>",
+        };
+        assert!(!MatcherEngine::evaluate(&m, &resp_no_match));
     }
 }

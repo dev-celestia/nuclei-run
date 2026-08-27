@@ -57,6 +57,26 @@ impl ExtractorEngine {
                     }
                 }
             }
+            "xpath" => {
+                let content = Self::get_content(extractor, response);
+                for path in &extractor.xpath {
+                    if let Some(value) = Self::extract_xpath(&content, path, extractor.attribute.as_deref()) {
+                        let xpath_name = if extractor.xpath.len() == 1 {
+                            name.clone()
+                        } else {
+                            path.clone()
+                        };
+                        results.insert(xpath_name, value);
+                    }
+                }
+            }
+            "dsl" => {
+                let content = Self::get_content(extractor, response);
+                for dsl_expr in &extractor.dsl {
+                    let val = crate::engine::dsl::TemplateDsl::interpolate(dsl_expr, &content, &HashMap::new());
+                    results.insert(name.clone(), val);
+                }
+            }
             _ => {}
         }
 
@@ -149,6 +169,28 @@ impl ExtractorEngine {
     }
 
     // -----------------------------------------------------------------------
+    // XPath Extraction
+    // -----------------------------------------------------------------------
+
+    fn extract_xpath(xml_text: &str, path: &str, _attribute: Option<&str>) -> Option<String> {
+        let package = sxd_document::parser::parse(xml_text).ok()?;
+        let document = package.as_document();
+        let factory = sxd_xpath::Factory::new();
+        let xpath = factory.build(path).ok()??;
+        let context = sxd_xpath::Context::new();
+        let value = xpath.evaluate(&context, document.root()).ok()?;
+        Some(match value {
+            sxd_xpath::Value::Nodeset(nodes) => {
+                let first = nodes.document_order().into_iter().next()?;
+                first.string_value()
+            }
+            sxd_xpath::Value::String(s) => s,
+            sxd_xpath::Value::Number(n) => n.to_string(),
+            sxd_xpath::Value::Boolean(b) => b.to_string(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Content Selection
     // -----------------------------------------------------------------------
 
@@ -189,6 +231,9 @@ mod tests {
             regex_group: Some(1),
             kval: vec![],
             json: vec![],
+            xpath: vec![],
+            attribute: None,
+            dsl: vec![],
             internal: false,
         };
 
@@ -207,6 +252,9 @@ mod tests {
             regex_group: None,
             kval: vec!["x-powered-by".to_string()],
             json: vec![],
+            xpath: vec![],
+            attribute: None,
+            dsl: vec![],
             internal: false,
         };
 
@@ -225,6 +273,9 @@ mod tests {
             regex_group: None,
             kval: vec![],
             json: vec![".role".to_string()],
+            xpath: vec![],
+            attribute: None,
+            dsl: vec![],
             internal: false,
         };
 
@@ -243,6 +294,9 @@ mod tests {
             regex_group: None,
             kval: vec![],
             json: vec![".tokens[0]".to_string()],
+            xpath: vec![],
+            attribute: None,
+            dsl: vec![],
             internal: false,
         };
 
@@ -261,11 +315,37 @@ mod tests {
             regex_group: Some(1),
             kval: vec![],
             json: vec![],
+            xpath: vec![],
+            attribute: None,
+            dsl: vec![],
             internal: true, // Should NOT appear in output values.
         };
 
         let resp = make_response();
         let output = ExtractorEngine::extract_output_values(&[ext], &resp);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_xpath_extractor() {
+        let ext = TemplateExtractor {
+            extractor_type: "xpath".to_string(),
+            name: Some("admin_name".to_string()),
+            part: Some("body".to_string()),
+            regex: vec![],
+            regex_group: None,
+            kval: vec![],
+            json: vec![],
+            xpath: vec!["//user[@role='admin']".to_string()],
+            attribute: None,
+            dsl: vec![],
+            internal: false,
+        };
+
+        let mut resp = make_response();
+        resp.body = "<users><user role='admin'>Alice</user></users>".to_string();
+
+        let result = ExtractorEngine::extract(&ext, &resp);
+        assert_eq!(result.get("admin_name"), Some(&"Alice".to_string()));
     }
 }

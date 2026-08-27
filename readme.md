@@ -248,6 +248,12 @@ Compatible with Tauri (event bus), egui/eframe (poll loop), and iced (subscripti
 | Rate limiting | Token-bucket (governor) |
 | Memory | Zero GC, bounded channels |
 
+## Documentation & Rust Rewrite Roadmap
+
+For a comprehensive technical breakdown of all features in the Go reference implementation and the architecture roadmap for Rust rewrite, see:
+- [Technical Architecture Scan & Implementation Plan](docs/IMPLEMENTATION_PLAN.md)
+- [Nuclei Go -> Rust Feature Matrix & Rewrite Specification](docs/NUCLEI_FEATURES_FOR_RUST_REWRITE.md)
+
 ## Acknowledgments
 
 This project would not exist without [Nuclei](https://github.com/projectdiscovery/nuclei) by [ProjectDiscovery](https://projectdiscovery.io/). All credit for the original template engine design, YAML template specification, and the incredible community-driven template ecosystem goes to the ProjectDiscovery team and its contributors. `nuclei-run` is a Rust reimplementation that builds upon their pioneering work — if you find this tool useful, please support the [original project](https://github.com/projectdiscovery/nuclei) that made it all possible.

@@ -1,7 +1,18 @@
+use crate::engine::code_client::CodeClient;
+use crate::engine::dns_client::DnsClient;
 use crate::engine::dsl::TemplateDsl;
 use crate::engine::extractor::ExtractorEngine;
+use crate::engine::file_client::FileClient;
+use crate::engine::fuzzing::FuzzingEngine;
+use crate::engine::headless_client::HeadlessClient;
+use crate::engine::host_errors::HostErrorsCache;
 use crate::engine::http_client::{HttpClient, HttpResponse};
+use crate::engine::js_client::JavaScriptClient;
 use crate::engine::matcher::{EvaluatedResponse, MatcherEngine};
+use crate::engine::network_client::NetworkClient;
+use crate::engine::ssl_client::SslClient;
+use crate::engine::websocket_client::WebSocketClient;
+use crate::engine::whois_client::WhoisClient;
 use crate::models::result::ScanFinding;
 use crate::models::template::NucleiTemplate;
 use governor::{Quota, RateLimiter};
@@ -12,8 +23,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Check if a string still contains unresolved Nuclei template variables.
-/// These look like `{{variable_name}}` and indicate the DSL engine couldn't
-/// resolve them — sending such requests produces false positives.
 fn has_unresolved_variables(s: &str) -> bool {
     let mut rest = s;
     while let Some(start) = rest.find("{{") {
@@ -40,8 +49,11 @@ pub struct ScanTask {
 /// The core scan engine orchestrating concurrent template execution.
 pub struct EngineRunner {
     concurrency: usize,
+    timeout_secs: u64,
     rate_limit_rps: u32,
     client: HttpClient,
+    enable_code_templates: bool,
+    host_errors: HostErrorsCache,
     request_counter: Arc<AtomicUsize>,
     is_cancelled: Arc<AtomicBool>,
 }
@@ -54,11 +66,16 @@ impl EngineRunner {
         max_redirects: usize,
         proxy_url: Option<&str>,
         custom_headers: &[(String, String)],
+        enable_code_templates: bool,
+        max_host_errors: usize,
     ) -> Self {
         Self {
             concurrency,
+            timeout_secs,
             rate_limit_rps,
             client: HttpClient::new(timeout_secs, max_redirects, proxy_url, custom_headers),
+            enable_code_templates,
+            host_errors: HostErrorsCache::new(max_host_errors),
             request_counter: Arc::new(AtomicUsize::new(0)),
             is_cancelled: Arc::new(AtomicBool::new(false)),
         }
@@ -132,7 +149,6 @@ impl EngineRunner {
                     break;
                 }
             }
-            // Closing the sender causes workers to exit after draining.
         });
 
         // Wait for all workers to complete.
@@ -141,48 +157,299 @@ impl EngineRunner {
         }
     }
 
-    /// Execute a single scan task (one target × one template with all HTTP blocks).
+    /// Execute a single scan task across all supported protocol blocks.
     async fn execute_task(&self, task: ScanTask, result_tx: &mpsc::Sender<ScanFinding>) {
         let target = &task.target;
-        let template = &task.template;
+        if self.host_errors.is_dropped(target).await {
+            return;
+        }
 
-        // Accumulate extracted variables across request blocks (for chaining).
+        let template = &task.template;
         let mut extracted_vars: HashMap<String, String> = HashMap::new();
 
-        for http_block in &template.http {
-            if self.is_cancelled.load(Ordering::Relaxed) {
-                return;
+        // 1. DNS Protocol Execution
+        for dns_block in &template.dns {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(dns_resp) = DnsClient::execute(dns_block, target).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: "",
+                    body: &dns_resp.raw,
+                };
+                let condition = dns_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&dns_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: dns_resp.host,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: dns_resp.records,
+                        protocol: "dns".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
             }
+        }
+
+        // 2. Network / TCP Protocol Execution
+        for net_block in &template.network {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(net_resp) = NetworkClient::execute(net_block, target, self.timeout_secs).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: "",
+                    body: &net_resp.body,
+                };
+                let condition = net_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&net_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: net_resp.host,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: vec![],
+                        protocol: if net_block.tls { "tls".to_string() } else { "tcp".to_string() },
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 3. SSL / TLS Protocol Execution
+        for ssl_block in &template.ssl {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(ssl_resp) = SslClient::execute(ssl_block, target, self.timeout_secs).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: &ssl_resp.cipher_suite,
+                    body: &ssl_resp.raw,
+                };
+                let condition = ssl_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&ssl_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: ssl_resp.address,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: vec![ssl_resp.subject_cn, ssl_resp.fingerprint_sha256],
+                        protocol: "ssl".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 4. WHOIS Protocol Execution
+        for whois_block in &template.whois {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(whois_resp) = WhoisClient::execute(whois_block, target, self.timeout_secs).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: "",
+                    body: &whois_resp.raw,
+                };
+                let condition = whois_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&whois_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: whois_resp.query,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: vec![],
+                        protocol: "whois".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 5. File Protocol Execution
+        for file_block in &template.file {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            let file_responses = FileClient::scan_path(file_block, target);
+            for f_resp in file_responses {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: &f_resp.extension,
+                    body: &f_resp.content,
+                };
+                let condition = file_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&file_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: f_resp.file_path,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: vec![],
+                        protocol: "file".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 6. Code Execution Protocol
+        for code_block in &template.code {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(code_resp) = CodeClient::execute(code_block, target, self.enable_code_templates).await {
+                let eval_resp = EvaluatedResponse {
+                    status: code_resp.exit_code as u16,
+                    headers: &code_resp.stderr,
+                    body: &code_resp.raw,
+                };
+                let condition = code_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&code_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: target.to_string(),
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: vec![code_resp.stdout],
+                        protocol: "code".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 7. WebSocket Protocol Execution
+        for ws_block in &template.websocket {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(ws_resp) = WebSocketClient::execute(ws_block, target, self.timeout_secs).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: "",
+                    body: &ws_resp.raw,
+                };
+                let condition = ws_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&ws_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: ws_resp.url,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: ws_resp.responses,
+                        protocol: "websocket".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 8. Headless Browser Protocol Execution
+        for headless_block in &template.headless {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(headless_resp) = HeadlessClient::execute(headless_block, target, self.timeout_secs).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 200,
+                    headers: "",
+                    body: &headless_resp.raw,
+                };
+                let condition = headless_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&headless_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: headless_resp.url,
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: headless_resp.script_results,
+                        protocol: "headless".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 9. JavaScript Protocol Execution
+        for js_block in &template.javascript {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            self.request_counter.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(js_resp) = JavaScriptClient::execute(js_block, target).await {
+                let eval_resp = EvaluatedResponse {
+                    status: 0,
+                    headers: "",
+                    body: &js_resp.raw,
+                };
+                let condition = js_block.matchers_condition.as_deref().unwrap_or("or");
+                if MatcherEngine::evaluate_all(&js_block.matchers, condition, &eval_resp) {
+                    let finding = ScanFinding {
+                        template_id: template.id.clone(),
+                        template_name: template.info.name.clone(),
+                        severity: template.info.severity.to_lowercase(),
+                        matched_url: target.to_string(),
+                        matched_at: chrono::Utc::now().to_rfc3339(),
+                        extracted_results: vec![js_resp.output],
+                        protocol: "javascript".to_string(),
+                        matcher_name: None,
+                        tags: template.info.tags.clone(),
+                    };
+                    let _ = result_tx.send(finding).await;
+                }
+            }
+        }
+
+        // 10. HTTP Request Blocks & Parameter Fuzzing
+        for http_block in &template.http {
+            if self.is_cancelled.load(Ordering::Relaxed) { return; }
 
             // Determine request mode: raw or path-based.
-            let requests_to_send: Vec<RequestSpec> = if !http_block.raw.is_empty() {
-                // Raw request mode.
+            let mut requests_to_send: Vec<RequestSpec> = if !http_block.raw.is_empty() {
                 http_block
                     .raw
                     .iter()
                     .map(|raw| {
-                        let interpolated =
-                            TemplateDsl::interpolate(raw, target, &extracted_vars);
+                        let interpolated = TemplateDsl::interpolate(raw, target, &extracted_vars);
                         RequestSpec::Raw(interpolated)
                     })
                     .collect()
             } else {
-                // Path-based request mode.
-                let method = http_block
-                    .method
-                    .as_deref()
-                    .unwrap_or("GET")
-                    .to_uppercase();
+                let method = http_block.method.as_deref().unwrap_or("GET").to_uppercase();
 
                 http_block
                     .path
                     .iter()
                     .map(|path| {
                         let resolved = TemplateDsl::interpolate(path, target, &extracted_vars);
-                        // Build full URL from resolved path.
-                        let url = if resolved.starts_with("http://")
-                            || resolved.starts_with("https://")
-                        {
+                        let url = if resolved.starts_with("http://") || resolved.starts_with("https://") {
                             resolved
                         } else {
                             let base = target.trim_end_matches('/');
@@ -193,18 +460,11 @@ impl EngineRunner {
                             }
                         };
 
-                        // Interpolate headers and body.
                         let mut headers = HashMap::new();
                         for (k, v) in &http_block.headers {
-                            headers.insert(
-                                k.clone(),
-                                TemplateDsl::interpolate(v, target, &extracted_vars),
-                            );
+                            headers.insert(k.clone(), TemplateDsl::interpolate(v, target, &extracted_vars));
                         }
-                        let body = http_block
-                            .body
-                            .as_ref()
-                            .map(|b| TemplateDsl::interpolate(b, target, &extracted_vars));
+                        let body = http_block.body.as_ref().map(|b| TemplateDsl::interpolate(b, target, &extracted_vars));
 
                         RequestSpec::Standard {
                             method: method.clone(),
@@ -216,13 +476,31 @@ impl EngineRunner {
                     .collect()
             };
 
-            for req_spec in requests_to_send {
-                if self.is_cancelled.load(Ordering::Relaxed) {
-                    return;
+            // If fuzzing blocks are specified, generate and append mutated fuzz requests
+            for fuzz_block in &template.fuzzing {
+                let fuzzed = FuzzingEngine::generate(
+                    fuzz_block,
+                    target,
+                    &http_block.headers,
+                    http_block.body.as_deref(),
+                );
+                for f_req in fuzzed {
+                    requests_to_send.push(RequestSpec::Standard {
+                        method: http_block.method.as_deref().unwrap_or("GET").to_uppercase(),
+                        url: f_req.url,
+                        headers: f_req.headers,
+                        body: f_req.body,
+                    });
                 }
+            }
 
-                // Skip requests with unresolved template variables — these would
-                // hit the target with garbage URLs and produce false positives.
+            let mut block_matched = false;
+            let has_matchers = !http_block.matchers.is_empty();
+            let has_non_internal_matchers = http_block.matchers.iter().any(|m| !m.internal);
+
+            for req_spec in requests_to_send {
+                if self.is_cancelled.load(Ordering::Relaxed) { return; }
+
                 let has_unresolved = match &req_spec {
                     RequestSpec::Standard { url, body, .. } => {
                         has_unresolved_variables(url)
@@ -230,9 +508,7 @@ impl EngineRunner {
                     }
                     RequestSpec::Raw(raw_content) => has_unresolved_variables(raw_content),
                 };
-                if has_unresolved {
-                    continue;
-                }
+                if has_unresolved { continue; }
 
                 self.request_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -254,55 +530,57 @@ impl EngineRunner {
                     }
                 };
 
-                // Run extractors first (for chaining, even before matching).
-                let new_extractions =
-                    ExtractorEngine::extract_all(&http_block.extractors, &response);
+                let new_extractions = ExtractorEngine::extract_all(&http_block.extractors, &response);
                 extracted_vars.extend(new_extractions);
 
-                // Evaluate matchers.
+                if !has_matchers {
+                    block_matched = true;
+                    break;
+                }
+
                 let eval_resp = EvaluatedResponse {
                     status: response.status,
                     headers: &response.headers_raw,
                     body: &response.body,
                 };
 
-                let condition = http_block
-                    .matchers_condition
-                    .as_deref()
-                    .unwrap_or("or");
+                let condition = http_block.matchers_condition.as_deref().unwrap_or("or");
+                let is_match = MatcherEngine::evaluate_all(&http_block.matchers, condition, &eval_resp);
 
-                let is_vulnerable =
-                    MatcherEngine::evaluate_all(&http_block.matchers, condition, &eval_resp);
+                if is_match {
+                    block_matched = true;
 
-                if is_vulnerable {
-                    // Get output-visible extracted values.
-                    let output_values =
-                        ExtractorEngine::extract_output_values(&http_block.extractors, &response);
+                    if has_non_internal_matchers {
+                        let output_values = ExtractorEngine::extract_output_values(&http_block.extractors, &response);
 
-                    let matched_url = match &req_spec {
-                        RequestSpec::Standard { url, .. } => url.clone(),
-                        RequestSpec::Raw(_) => target.to_string(),
-                    };
+                        let matched_url = match &req_spec {
+                            RequestSpec::Standard { url, .. } => url.clone(),
+                            RequestSpec::Raw(_) => target.to_string(),
+                        };
 
-                    let finding = ScanFinding {
-                        template_id: template.id.clone(),
-                        template_name: template.info.name.clone(),
-                        severity: template.info.severity.to_lowercase(),
-                        matched_url,
-                        matched_at: chrono::Utc::now().to_rfc3339(),
-                        extracted_results: output_values,
-                        protocol: "http".to_string(),
-                        matcher_name: None,
-                        tags: template.info.tags.clone(),
-                    };
+                        let finding = ScanFinding {
+                            template_id: template.id.clone(),
+                            template_name: template.info.name.clone(),
+                            severity: template.info.severity.to_lowercase(),
+                            matched_url,
+                            matched_at: chrono::Utc::now().to_rfc3339(),
+                            extracted_results: output_values,
+                            protocol: "http".to_string(),
+                            matcher_name: None,
+                            tags: template.info.tags.clone(),
+                        };
 
-                    let _ = result_tx.send(finding).await;
+                        let _ = result_tx.send(finding).await;
+                    }
 
-                    // If stop-at-first-match, skip remaining paths in this block.
-                    if http_block.stop_at_first_match {
+                    if !has_non_internal_matchers || http_block.stop_at_first_match {
                         break;
                     }
                 }
+            }
+
+            if has_matchers && !block_matched {
+                return;
             }
         }
     }
@@ -318,3 +596,4 @@ enum RequestSpec {
     },
     Raw(String),
 }
+

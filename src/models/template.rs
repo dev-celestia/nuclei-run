@@ -7,7 +7,8 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 
 /// Root template structure compatible with Nuclei v2/v3 YAML specifications.
-/// Handles both modern `http:` and legacy `requests:` keys via serde alias.
+/// Handles modern `http:`, legacy `requests:`, `dns:`, `network:`/`tcp:`, `ssl:`,
+/// `whois:`, `file:`, `code:`, `fuzzing:`, and `flow:`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NucleiTemplate {
     pub id: String,
@@ -17,13 +18,65 @@ pub struct NucleiTemplate {
     #[serde(default, alias = "requests")]
     pub http: Vec<HttpBlock>,
 
-    /// Flow control expression (Nuclei v3+). Skipped if present but not yet supported.
+    /// DNS request blocks.
+    #[serde(default)]
+    pub dns: Vec<DnsBlock>,
+
+    /// Network / TCP / UDP socket blocks.
+    #[serde(default, alias = "tcp")]
+    pub network: Vec<NetworkBlock>,
+
+    /// SSL / TLS inspection blocks.
+    #[serde(default)]
+    pub ssl: Vec<SslBlock>,
+
+    /// WHOIS query blocks.
+    #[serde(default)]
+    pub whois: Vec<WhoisBlock>,
+
+    /// Local file inspection blocks.
+    #[serde(default)]
+    pub file: Vec<FileBlock>,
+
+    /// Code execution blocks.
+    #[serde(default)]
+    pub code: Vec<CodeBlock>,
+
+    /// WebSocket protocol blocks.
+    #[serde(default, alias = "ws")]
+    pub websocket: Vec<WebSocketBlock>,
+
+    /// Headless browser blocks.
+    #[serde(default)]
+    pub headless: Vec<HeadlessBlock>,
+
+    /// JavaScript execution blocks.
+    #[serde(default, alias = "js")]
+    pub javascript: Vec<JavaScriptBlock>,
+
+    /// Parameter fuzzing blocks.
+    #[serde(default)]
+    pub fuzzing: Vec<FuzzingBlock>,
+
+    /// Flow control expression (Nuclei v3+).
     #[serde(default)]
     pub flow: Option<String>,
+
+    /// Cryptographic template signature (Ed25519/ECDSA).
+    #[serde(default, rename = "digest")]
+    pub signature: Option<String>,
+
+    /// Self-contained template (doesn't require target input).
+    #[serde(default, rename = "self-contained")]
+    pub self_contained: bool,
 
     /// Template-level variables for substitution.
     #[serde(default)]
     pub variables: HashMap<String, serde_yaml::Value>,
+
+    /// Template-level constants for substitution.
+    #[serde(default)]
+    pub constants: HashMap<String, serde_yaml::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +250,365 @@ pub struct HttpBlock {
     /// Cookie reuse across requests within this block.
     #[serde(default, rename = "cookie-reuse")]
     pub cookie_reuse: Option<bool>,
+
+    /// Race condition testing.
+    #[serde(default)]
+    pub race: bool,
+
+    /// Number of concurrent requests for race condition.
+    #[serde(default, rename = "race_number")]
+    pub race_number: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// DNS Protocol Block (`dns:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsBlock {
+    /// Domain name to query (e.g. `{{FQDN}}`).
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// DNS record query type: A, AAAA, CNAME, NS, TXT, MX, PTR, SOA, SRV, CAA, AXFR.
+    #[serde(default, rename = "type")]
+    pub query_type: Option<String>,
+
+    /// Custom recursive resolvers (e.g. `["1.1.1.1:53", "8.8.8.8:53"]`).
+    #[serde(default)]
+    pub resolvers: Vec<String>,
+
+    /// Trace / recursion.
+    #[serde(default)]
+    pub recursion: bool,
+
+    /// Number of retries on timeout.
+    #[serde(default)]
+    pub retries: Option<usize>,
+
+    /// Matchers condition ("and" or "or").
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers for DNS responses.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors for DNS responses.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// Network / TCP Protocol Block (`network:` / `tcp:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkBlock {
+    /// Host to connect to (e.g. `{{Hostname}}:8080` or `tcp://{{Host}}:{{Port}}`).
+    #[serde(default)]
+    pub host: Vec<String>,
+
+    /// Port list.
+    #[serde(default)]
+    pub port: Option<String>,
+
+    /// TLS over TCP socket.
+    #[serde(default)]
+    pub tls: bool,
+
+    /// Conversation input steps.
+    #[serde(default)]
+    pub inputs: Vec<NetworkInput>,
+
+    /// Expected read size in bytes.
+    #[serde(default, rename = "read-size")]
+    pub read_size: Option<usize>,
+
+    /// Matchers condition ("and" or "or").
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInput {
+    /// Data string to send.
+    #[serde(default)]
+    pub data: Option<String>,
+
+    /// Input type: "hex" or "text".
+    #[serde(default, rename = "type")]
+    pub input_type: Option<String>,
+
+    /// Number of bytes to read after sending.
+    #[serde(default)]
+    pub read: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// SSL / TLS Protocol Block (`ssl:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SslBlock {
+    /// Address to inspect (e.g. `{{Host}}:{{Port}}`).
+    #[serde(default)]
+    pub address: Option<String>,
+
+    /// Minimum TLS version.
+    #[serde(default, rename = "min-version")]
+    pub min_version: Option<String>,
+
+    /// Maximum TLS version.
+    #[serde(default, rename = "max-version")]
+    pub max_version: Option<String>,
+
+    /// Cipher suites to test.
+    #[serde(default, rename = "cipher-suites")]
+    pub cipher_suites: Vec<String>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// WHOIS Protocol Block (`whois:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoisBlock {
+    /// Query domain/IP.
+    #[serde(default)]
+    pub query: Option<String>,
+
+    /// Custom WHOIS server.
+    #[serde(default)]
+    pub server: Option<String>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// Local File Protocol Block (`file:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileBlock {
+    /// File paths or globs to scan.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// Code Execution Protocol Block (`code:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeBlock {
+    /// Engine / Interpreter: "sh", "bash", "python3", "powershell", "cmd".
+    #[serde(default, rename = "engine")]
+    pub engine: Option<String>,
+
+    /// Source code / script content.
+    #[serde(default)]
+    pub source: Option<String>,
+
+    /// Arguments to pass to script.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket Protocol Block (`websocket:` / `ws:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketBlock {
+    /// WebSocket path or relative URL.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Inputs / messages to send over WebSocket.
+    #[serde(default)]
+    pub inputs: Vec<NetworkInput>,
+
+    /// Custom headers for WebSocket handshake.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+
+    /// Matchers condition: "and" | "or".
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// Headless Browser Protocol Block (`headless:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeadlessBlock {
+    /// Steps / actions to execute in headless browser.
+    #[serde(default)]
+    pub steps: Vec<HeadlessStep>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeadlessStep {
+    /// Action: "navigate", "click", "type", "wait-for", "script", "screenshot", "extract".
+    #[serde(default, rename = "action")]
+    pub action: String,
+
+    /// Target URL or CSS selector.
+    #[serde(default)]
+    pub target: Option<String>,
+
+    /// Script source for action: "script".
+    #[serde(default, rename = "code")]
+    pub code: Option<String>,
+
+    /// Key/Value pairs for form typing or headers.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    #[serde(default)]
+    pub value: Option<String>,
+
+    /// Extra arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// JavaScript Execution Protocol Block (`javascript:` / `js:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JavaScriptBlock {
+    /// JavaScript code / script content.
+    #[serde(default, alias = "source")]
+    pub code: Option<String>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
+}
+
+// ---------------------------------------------------------------------------
+// Parameter Fuzzing Block (`fuzzing:`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzingBlock {
+    /// Target components to fuzz: "query", "headers", "cookie", "body", "path".
+    #[serde(default)]
+    pub part: Option<String>,
+
+    /// Attack type: "sniper", "pitchfork", "clusterbomb".
+    #[serde(default, rename = "type")]
+    pub attack_type: Option<String>,
+
+    /// Injection mode: "replace", "prefix", "postfix", "infix".
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// Keys / parameter names to fuzz.
+    #[serde(default)]
+    pub keys: Vec<String>,
+
+    /// Payloads list or map.
+    #[serde(default)]
+    pub payloads: HashMap<String, Vec<String>>,
+
+    /// Matchers condition.
+    #[serde(default, rename = "matchers-condition")]
+    pub matchers_condition: Option<String>,
+
+    /// Matchers.
+    #[serde(default)]
+    pub matchers: Vec<TemplateMatcher>,
+
+    /// Extractors.
+    #[serde(default)]
+    pub extractors: Vec<TemplateExtractor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,11 +617,11 @@ pub struct HttpBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateMatcher {
-    /// Matcher type: "word", "regex", "status", "binary", "dsl".
+    /// Matcher type: "word", "regex", "status", "binary", "dsl", "size", "xpath", "time".
     #[serde(rename = "type")]
     pub matcher_type: String,
 
-    /// Response part to match against: "body", "header", "all_headers", "response", "status".
+    /// Response part to match against: "body", "header", "all_headers", "response", "status", "raw", "interactsh_protocol", "interactsh_request", "interactsh_response".
     #[serde(default)]
     pub part: Option<String>,
 
@@ -233,6 +645,18 @@ pub struct TemplateMatcher {
     #[serde(default)]
     pub binary: Vec<String>,
 
+    /// Size in bytes to match.
+    #[serde(default)]
+    pub size: Vec<usize>,
+
+    /// XPath expressions for XML / HTML matching.
+    #[serde(default)]
+    pub xpath: Vec<String>,
+
+    /// Response time in seconds/ms.
+    #[serde(default)]
+    pub time: Vec<u64>,
+
     /// Logical condition within this matcher's patterns: "and" or "or".
     #[serde(default)]
     pub condition: Option<String>,
@@ -245,13 +669,18 @@ pub struct TemplateMatcher {
     #[serde(default, rename = "case-insensitive")]
     pub case_insensitive: bool,
 
-    /// Encoding to apply before matching.
+    /// Encoding to apply before matching (e.g. "hex").
     #[serde(default)]
     pub encoding: Option<String>,
 
     /// Name identifier for internal reference.
     #[serde(default)]
     pub name: Option<String>,
+
+    /// When true, matcher is evaluated for internal flow control / prerequisites
+    /// and does not emit a finding on its own.
+    #[serde(default, rename = "internal")]
+    pub internal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +715,18 @@ pub struct TemplateExtractor {
     /// JSON path expressions.
     #[serde(default)]
     pub json: Vec<String>,
+
+    /// XPath expressions.
+    #[serde(default)]
+    pub xpath: Vec<String>,
+
+    /// HTML attribute to extract for XPath (e.g. "href", "value").
+    #[serde(default)]
+    pub attribute: Option<String>,
+
+    /// DSL expressions for extraction.
+    #[serde(default)]
+    pub dsl: Vec<String>,
 
     /// When true, extracted value is stored for chaining but not outputted.
     #[serde(default, rename = "internal")]

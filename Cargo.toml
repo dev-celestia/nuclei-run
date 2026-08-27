@@ -38,14 +38,46 @@ walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# DSL Helpers
+# DSL & Crypto Helpers
 md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+murmur3 = "0.5"
+crc32fast = "1.4"
+flate2 = "1.0"
+hex = "0.4"
+aes = "0.8"
+cbc = "0.1"
+aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.8"
+
+# DNS Protocol
+hickory-resolver = "0.24"
+hickory-proto = "0.24"
+
+# TLS & SSL Inspection
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pki-types = "1.0"
+x509-parser = "0.16"
+
+# XML / XPath Processing
+sxd-document = "0.3"
+sxd-xpath = "0.4"
 
 # Concurrency
 async-channel = "2"
 async-trait = "0.1"
+
+# WebSockets & Streams
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# Cryptographic Signatures & OOB Decryption
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rsa = { version = "0.9", features = ["sha2"] }
 
 # Misc
 thiserror = "2"

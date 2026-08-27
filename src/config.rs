@@ -41,6 +41,32 @@ pub struct ScanConfig {
     /// Output file path (for JSONL/SARIF).
     pub output_path: Option<String>,
 
+    /// Markdown export path.
+    pub markdown_export: Option<String>,
+
+    /// Enable code protocol execution.
+    pub enable_code_templates: bool,
+
+    /// Uncover OSINT search query.
+    pub uncover: bool,
+    pub uncover_query: Option<String>,
+    pub uncover_engine: Option<String>,
+
+    /// Custom Interactsh server.
+    pub interactsh_server: Option<String>,
+
+    /// Maximum consecutive host errors before dropping host (0 = disabled).
+    pub max_host_errors: usize,
+
+    /// Cryptographically sign templates with generated/provided key.
+    pub sign_templates: bool,
+
+    /// Refuse executing unsigned templates.
+    pub disable_unsigned_templates: bool,
+
+    /// Deduplicate identical HTTP requests across templates.
+    pub cluster_requests: bool,
+
     /// Enable JSONL output format.
     pub jsonl: bool,
 

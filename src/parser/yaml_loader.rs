@@ -93,29 +93,26 @@ fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoadOut
         Err(e) => return TemplateLoadOutcome::ParseError(e.to_string()),
     };
 
-    // Quick check: skip templates with unsupported protocol blocks.
-    // These are indicated by top-level keys we don't handle yet.
-    if has_unsupported_protocol(&content) {
-        return TemplateLoadOutcome::Unsupported;
-    }
-
-    // Skip templates that require interactsh OOB callbacks (unsupported).
-    if requires_interactsh(&content) {
-        return TemplateLoadOutcome::Unsupported;
-    }
-
-    // Skip templates with flow control (unsupported multi-step orchestration).
-    if has_flow_control(&content) {
-        return TemplateLoadOutcome::Unsupported;
-    }
-
     let template: NucleiTemplate = match serde_yaml::from_str(&content) {
         Ok(t) => t,
         Err(e) => return TemplateLoadOutcome::ParseError(e.to_string()),
     };
 
-    // Skip templates that have no HTTP blocks (e.g., dns-only, file-only).
-    if template.http.is_empty() {
+    // Ensure template has at least one executable block
+    let has_executable_blocks = !template.http.is_empty()
+        || !template.dns.is_empty()
+        || !template.network.is_empty()
+        || !template.ssl.is_empty()
+        || !template.whois.is_empty()
+        || !template.file.is_empty()
+        || !template.code.is_empty()
+        || !template.websocket.is_empty()
+        || !template.headless.is_empty()
+        || !template.javascript.is_empty()
+        || !template.fuzzing.is_empty()
+        || template.flow.is_some();
+
+    if !has_executable_blocks {
         return TemplateLoadOutcome::Unsupported;
     }
 
@@ -125,51 +122,6 @@ fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoadOut
     }
 
     TemplateLoadOutcome::Loaded(template)
-}
-
-/// Check if the raw YAML content contains unsupported protocol blocks.
-fn has_unsupported_protocol(content: &str) -> bool {
-    // Only check top-level keys (no leading whitespace).
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        // Only check lines that are at the top level (no indentation before key).
-        if line == trimmed {
-            if trimmed.starts_with("dns:")
-                || trimmed.starts_with("ssl:")
-                || trimmed.starts_with("headless:")
-                || trimmed.starts_with("code:")
-                || trimmed.starts_with("file:")
-                || trimmed.starts_with("tcp:")
-                || trimmed.starts_with("network:")
-                || trimmed.starts_with("websocket:")
-                || trimmed.starts_with("whois:")
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Check if the template requires interactsh OOB (out-of-band) callbacks.
-/// These templates rely on a callback server to verify SSRF/RCE and cannot
-/// be accurately evaluated without one — they produce false positives.
-fn requires_interactsh(content: &str) -> bool {
-    content.contains("interactsh-url")
-        || content.contains("interactsh_url")
-        || content.contains("oast.")
-}
-
-/// Check if the template uses flow control expressions (Nuclei v3+).
-/// These require JavaScript-based orchestration that isn't supported yet.
-fn has_flow_control(content: &str) -> bool {
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if line == trimmed && trimmed.starts_with("flow:") {
-            return true;
-        }
-    }
-    false
 }
 
 /// Check if template passes all active filters.

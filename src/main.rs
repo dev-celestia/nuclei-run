@@ -73,23 +73,63 @@ struct Cli {
 
     /// Output file path
     #[arg(short = 'o', long = "output")]
-    output: Option<String>,
+    pub output: Option<String>,
+
+    /// Export scan results to Markdown report file
+    #[arg(short = 'm', long = "markdown-export")]
+    pub markdown_export: Option<String>,
+
+    /// Enable local code execution protocol templates
+    #[arg(long = "enable-code-templates")]
+    pub enable_code_templates: bool,
+
+    /// Discover targets via Uncover OSINT engines
+    #[arg(short = 'u', long = "uncover", alias = "uc")]
+    pub uncover: bool,
+
+    /// Uncover search query
+    #[arg(long = "uncover-query", short = 'q', alias = "uq")]
+    pub uncover_query: Option<String>,
+
+    /// Uncover search engine (shodan, censys, fofa, zoomeye, netlas, quake, hunter)
+    #[arg(long = "uncover-engine", short = 'e', alias = "ue")]
+    pub uncover_engine: Option<String>,
+
+    /// Custom Interactsh server address
+    #[arg(long = "interactsh-server", alias = "iserver")]
+    pub interactsh_server: Option<String>,
+
+    /// Maximum consecutive host errors before dropping host (circuit breaker)
+    #[arg(long = "max-host-error", short = 'm', alias = "mhe", default_value = "30")]
+    pub max_host_errors: usize,
+
+    /// Cryptographically sign templates in place with Ed25519
+    #[arg(long = "sign")]
+    pub sign: bool,
+
+    /// Refuse executing unsigned templates
+    #[arg(long = "disable-unsigned-templates", alias = "duts")]
+    pub disable_unsigned_templates: bool,
+
+    /// Deduplicate identical HTTP requests across templates
+    #[arg(long = "cluster-requests")]
+    pub cluster_requests: bool,
 
     /// Enable JSON Lines output
     #[arg(long = "jsonl")]
-    jsonl: bool,
+    pub jsonl: bool,
 
     /// Enable SARIF v2.1.0 output
     #[arg(long = "sarif")]
-    sarif: bool,
+    pub sarif: bool,
 
     /// Silent mode: suppress banner and progress
     #[arg(long = "silent")]
-    silent: bool,
+    pub silent: bool,
 
     /// Force re-download of remote templates (bypass cache)
     #[arg(long = "update-templates", short = 'U')]
-    update_templates: bool,
+    pub update_templates: bool,
 }
 
 #[tokio::main]
@@ -168,9 +208,30 @@ async fn main() {
         output::stdout::print_target_summary(targets.len());
     }
 
+    // Handle template signing mode if requested
+    if scan_config.sign_templates {
+        let (signing_key, _) = engine::crypto_signer::TemplateSigner::generate_keypair();
+        for t_path in &scan_config.template_paths {
+            let p = std::path::Path::new(t_path);
+            if p.is_file() {
+                let _ = engine::crypto_signer::TemplateSigner::sign_file(p, &signing_key);
+                eprintln!("[INF] Signed template: {}", t_path);
+            }
+        }
+        return;
+    }
+
     // Build scan tasks: each (target, template) pair.
     let templates_arc: Vec<Arc<models::template::NucleiTemplate>> =
         all_templates.into_iter().map(Arc::new).collect();
+
+    // Check request clustering if enabled
+    if scan_config.cluster_requests {
+        let clusters = engine::clustering::RequestClusterer::cluster(&targets, &templates_arc);
+        if !scan_config.silent {
+            eprintln!("[INF] Clustered into {} distinct HTTP requests across {} templates", clusters.len(), templates_arc.len());
+        }
+    }
 
     let mut tasks = Vec::new();
     for target in &targets {
@@ -190,6 +251,8 @@ async fn main() {
         scan_config.max_redirects,
         scan_config.proxy.as_deref(),
         &scan_config.custom_headers,
+        scan_config.enable_code_templates,
+        scan_config.max_host_errors,
     ));
 
     // Set up finding channel.
@@ -259,7 +322,7 @@ async fn main() {
         }
     }
 
-    // Print summary.
+    // Summary calculation
     let total_requests = engine.request_count();
     let elapsed_millis = elapsed.as_millis();
     let rps = if elapsed.as_secs_f64() > 0.0 {
@@ -268,16 +331,26 @@ async fn main() {
         0.0
     };
 
+    let summary = ScanSummary {
+        total_requests,
+        total_findings: all_findings.len(),
+        findings_by_severity: severity_counts,
+        templates_loaded: templates_arc.len(),
+        targets_scanned: targets.len(),
+        elapsed_millis,
+        rps,
+    };
+
+    // Write Markdown report if requested.
+    if let Some(ref md_path) = scan_config.markdown_export {
+        if let Err(e) = output::markdown::MarkdownReporter::write_report(&all_findings, Some(&summary), md_path) {
+            eprintln!("[ERR] Failed to write Markdown report to {}: {}", md_path, e);
+        } else if !scan_config.silent {
+            eprintln!("[INF] Markdown report written to {}", md_path);
+        }
+    }
+
     if !scan_config.silent {
-        let summary = ScanSummary {
-            total_requests,
-            total_findings: all_findings.len(),
-            findings_by_severity: severity_counts,
-            templates_loaded: templates_arc.len(),
-            targets_scanned: targets.len(),
-            elapsed_millis,
-            rps,
-        };
         output::stdout::print_summary(&summary);
     }
 
@@ -323,6 +396,16 @@ fn build_config(cli: &Cli) -> ScanConfig {
         proxy: cli.proxy.clone(),
         custom_headers,
         output_path: cli.output.clone(),
+        markdown_export: cli.markdown_export.clone(),
+        enable_code_templates: cli.enable_code_templates,
+        uncover: cli.uncover,
+        uncover_query: cli.uncover_query.clone(),
+        uncover_engine: cli.uncover_engine.clone(),
+        interactsh_server: cli.interactsh_server.clone(),
+        max_host_errors: cli.max_host_errors,
+        sign_templates: cli.sign,
+        disable_unsigned_templates: cli.disable_unsigned_templates,
+        cluster_requests: cli.cluster_requests,
         jsonl: cli.jsonl,
         sarif: cli.sarif,
         silent: cli.silent,
