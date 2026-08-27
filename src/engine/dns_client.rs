@@ -9,6 +9,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct DnsResponse {
     pub host: String,
+    #[allow(dead_code)]
     pub query_type: String,
     pub raw: String,
     pub records: Vec<String>,

@@ -47,6 +47,9 @@ pub struct ScanConfig {
     /// Enable code protocol execution.
     pub enable_code_templates: bool,
 
+    /// Enable headless browser protocol execution.
+    pub headless: bool,
+
     /// Uncover OSINT search query.
     pub uncover: bool,
     pub uncover_query: Option<String>,
@@ -58,11 +61,47 @@ pub struct ScanConfig {
     /// Maximum consecutive host errors before dropping host (0 = disabled).
     pub max_host_errors: usize,
 
+    /// Detect potential honeypot hosts based on match concentration.
+    pub honeypot_detect: bool,
+
+    /// Distinct template IDs required to flag a honeypot host.
+    pub honeypot_threshold: usize,
+
+    /// Suppress output for flagged honeypot hosts.
+    pub suppress_honeypot: bool,
+
     /// Cryptographically sign templates with generated/provided key.
     pub sign_templates: bool,
 
     /// Refuse executing unsigned templates.
     pub disable_unsigned_templates: bool,
+
+    /// Path to the Ed25519 signing key (hex) for signing/verification.
+    pub signing_key_path: Option<String>,
+
+    /// Elasticsearch export destination (base URL).
+    pub export_elasticsearch: Option<String>,
+
+    /// Elasticsearch index name.
+    pub es_index: String,
+
+    /// Splunk HEC export destination (base URL).
+    pub export_splunk: Option<String>,
+
+    /// Splunk HEC token.
+    pub splunk_token: Option<String>,
+
+    /// Webhook export destination (JSON POST).
+    pub export_webhook: Option<String>,
+
+    /// Issue tracker kind: github, gitlab, jira, linear.
+    pub tracker: Option<String>,
+
+    /// Tracker project identifier.
+    pub tracker_project: Option<String>,
+
+    /// Tracker host URL (Jira host or self-hosted GitLab).
+    pub tracker_url: Option<String>,
 
     /// Deduplicate identical HTTP requests across templates.
     pub cluster_requests: bool,

@@ -22,7 +22,11 @@ impl CodeClient {
             return Err("Code template execution is disabled. Use --enable-code-templates to run.".to_string());
         }
 
-        let engine = block.engine.as_deref().unwrap_or("sh");
+        let engine = block
+            .engine
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("sh");
         let source = block.source.as_deref().unwrap_or("");
 
         let mut cmd = match engine {

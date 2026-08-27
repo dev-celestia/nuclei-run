@@ -445,8 +445,9 @@ pub struct FileBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeBlock {
     /// Engine / Interpreter: "sh", "bash", "python3", "powershell", "cmd".
-    #[serde(default, rename = "engine")]
-    pub engine: Option<String>,
+    /// Templates use both `engine: python` and `engine: [python]` forms.
+    #[serde(default, rename = "engine", deserialize_with = "string_or_seq")]
+    pub engine: Vec<String>,
 
     /// Source code / script content.
     #[serde(default)]
@@ -467,6 +468,25 @@ pub struct CodeBlock {
     /// Extractors.
     #[serde(default)]
     pub extractors: Vec<TemplateExtractor>,
+}
+
+/// Accept either a scalar string or a sequence of strings, returning a Vec.
+/// Nuclei templates use both forms for fields like `engine:`.
+fn string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => Ok(v),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +549,10 @@ pub struct HeadlessStep {
     #[serde(default, rename = "action")]
     pub action: String,
 
+    /// Name of this step's result (a named matcher part, e.g. `name: extract`).
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Target URL or CSS selector.
     #[serde(default)]
     pub target: Option<String>,
@@ -544,9 +568,10 @@ pub struct HeadlessStep {
     #[serde(default)]
     pub value: Option<String>,
 
-    /// Extra arguments.
+    /// Extra arguments (nuclei defines these as a string map,
+    /// e.g. `args: {url: "..."}` for the navigate action).
     #[serde(default)]
-    pub args: Vec<String>,
+    pub args: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +583,14 @@ pub struct JavaScriptBlock {
     /// JavaScript code / script content.
     #[serde(default, alias = "source")]
     pub code: Option<String>,
+
+    /// Pre-condition expression; when falsy, the block is skipped.
+    #[serde(default, rename = "pre-condition")]
+    pub pre_condition: Option<String>,
+
+    /// Arguments injected into the JS runtime as globals.
+    #[serde(default)]
+    pub args: HashMap<String, String>,
 
     /// Matchers condition.
     #[serde(default, rename = "matchers-condition")]

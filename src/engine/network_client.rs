@@ -10,8 +10,10 @@ use tokio_rustls::TlsConnector;
 #[derive(Debug, Clone)]
 pub struct NetworkResponse {
     pub host: String,
+    #[allow(dead_code)]
     pub raw: String,
     pub body: String,
+    #[allow(dead_code)]
     pub duration_ms: u64,
 }
 

@@ -170,7 +170,9 @@ impl UiScannerAdapter for NucleiUiEngine {
             None,
             &[],
             false,
+            false,
             0,
+            None,
         ));
 
         // Create internal finding channel.

@@ -1,149 +1,267 @@
-use crate::models::template::NucleiTemplate;
+//! Flow-control template support.
+//!
+//! Nuclei `flow:` templates gate request execution with a script (evaluated by
+//! goja in the original). This engine supports the boolean subset of that DSL:
+//! `http(n)`, `dns(n)`, `network(n)`/`tcp(n)`, `ssl(n)`, `code(n)` calls
+//! combined with `&&`, `||`, `!` and parentheses (1-based indices, JS operator
+//! precedence, short-circuit evaluation).
+//!
+//! Templates whose flow uses unsupported constructs (loops, functions,
+//! `iterate`, `set`, `template.*`, other protocols) are reported as
+//! unsupported and skipped instead of being executed without their gating
+//! logic — running the blocks unconditionally produced false positives.
 
-/// Flow step execution instructions.
-#[derive(Debug, Clone)]
-pub enum FlowStep {
+/// A parsed flow expression node. Protocol indices are stored 0-based.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlowNode {
     Http(usize),
     Dns(usize),
     Network(usize),
     Ssl(usize),
     Code(usize),
+    Bool(bool),
+    Not(Box<FlowNode>),
+    And(Box<FlowNode>, Box<FlowNode>),
+    Or(Box<FlowNode>, Box<FlowNode>),
 }
 
-pub struct FlowEngine;
-
-impl FlowEngine {
-    /// Parse a simple flow script into executable protocol sequence steps.
-    pub fn parse_flow_steps(flow_script: &str, template: &NucleiTemplate) -> Vec<FlowStep> {
-        let mut steps = Vec::new();
-
-        for line in flow_script.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains("http(") {
-                if let Some(idx) = extract_index(trimmed, "http") {
-                    if idx < template.http.len() {
-                        steps.push(FlowStep::Http(idx));
-                    }
-                }
-            } else if trimmed.contains("dns(") {
-                if let Some(idx) = extract_index(trimmed, "dns") {
-                    if idx < template.dns.len() {
-                        steps.push(FlowStep::Dns(idx));
-                    }
-                }
-            } else if trimmed.contains("network(") || trimmed.contains("tcp(") {
-                if let Some(idx) = extract_index(trimmed, "network").or_else(|| extract_index(trimmed, "tcp")) {
-                    if idx < template.network.len() {
-                        steps.push(FlowStep::Network(idx));
-                    }
-                }
-            } else if trimmed.contains("ssl(") {
-                if let Some(idx) = extract_index(trimmed, "ssl") {
-                    if idx < template.ssl.len() {
-                        steps.push(FlowStep::Ssl(idx));
-                    }
-                }
-            } else if trimmed.contains("code(") {
-                if let Some(idx) = extract_index(trimmed, "code") {
-                    if idx < template.code.len() {
-                        steps.push(FlowStep::Code(idx));
-                    }
-                }
-            }
-        }
-
-        // If no explicit steps were parsed, default to executing all blocks sequentially
-        if steps.is_empty() {
-            for i in 0..template.http.len() {
-                steps.push(FlowStep::Http(i));
-            }
-            for i in 0..template.dns.len() {
-                steps.push(FlowStep::Dns(i));
-            }
-            for i in 0..template.network.len() {
-                steps.push(FlowStep::Network(i));
-            }
-            for i in 0..template.ssl.len() {
-                steps.push(FlowStep::Ssl(i));
-            }
-            for i in 0..template.code.len() {
-                steps.push(FlowStep::Code(i));
-            }
-        }
-
-        steps
+/// Parse a flow expression. Returns `None` when the expression uses syntax
+/// outside the supported boolean subset (the template must then be skipped).
+pub fn parse_flow(expr: &str) -> Option<FlowNode> {
+    let tokens = tokenize(expr)?;
+    let mut parser = Parser { tokens, pos: 0 };
+    let node = parser.parse_or()?;
+    if parser.pos != parser.tokens.len() {
+        return None; // trailing tokens -> unsupported syntax
     }
+    Some(node)
 }
 
-fn extract_index(s: &str, func_name: &str) -> Option<usize> {
-    let pat = format!("{}(", func_name);
-    if let Some(start) = s.find(&pat) {
-        if let Some(end) = s[start + pat.len()..].find(')') {
-            let inner = &s[start + pat.len()..start + pat.len() + end].trim().trim_matches('\'').trim_matches('"');
-            return inner.parse::<usize>().ok();
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Call(String, usize), // protocol name, 0-based index
+    Bool(bool),
+    And,
+    Or,
+    Not,
+    LParen,
+    RParen,
+}
+
+fn tokenize(input: &str) -> Option<Vec<Token>> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            '&' => {
+                if i + 1 < chars.len() && chars[i + 1] == '&' {
+                    tokens.push(Token::And);
+                    i += 2;
+                } else {
+                    return None;
+                }
+            }
+            '|' => {
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    tokens.push(Token::Or);
+                    i += 2;
+                } else {
+                    return None;
+                }
+            }
+            '!' => {
+                if chars.get(i + 1) == Some(&'=') {
+                    return None; // `!=` comparison — unsupported
+                }
+                tokens.push(Token::Not);
+                i += 1;
+            }
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+            }
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                match ident.as_str() {
+                    "true" => tokens.push(Token::Bool(true)),
+                    "false" => tokens.push(Token::Bool(false)),
+                    "http" | "dns" | "network" | "tcp" | "ssl" | "code" => {
+                        // Expect `(N)` with a 1-based index.
+                        if chars.get(i) != Some(&'(') {
+                            return None;
+                        }
+                        i += 1;
+                        let num_start = i;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        if num_start == i || chars.get(i) != Some(&')') {
+                            return None;
+                        }
+                        let num: String = chars[num_start..i].iter().collect();
+                        i += 1;
+                        let idx: usize = num.parse().ok()?;
+                        if idx == 0 {
+                            return None; // nuclei flow indices are 1-based
+                        }
+                        tokens.push(Token::Call(ident.to_string(), idx - 1));
+                    }
+                    _ => return None, // unknown identifier -> unsupported
+                }
+            }
+            _ => return None, // numbers, strings, operators, etc. -> unsupported
         }
     }
-    None
+
+    Some(tokens)
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn advance(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    /// or_expr := and_expr ('||' and_expr)*
+    fn parse_or(&mut self) -> Option<FlowNode> {
+        let mut left = self.parse_and()?;
+        while self.peek() == Some(&Token::Or) {
+            self.advance();
+            let right = self.parse_and()?;
+            left = FlowNode::Or(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    /// and_expr := unary ('&&' unary)*
+    fn parse_and(&mut self) -> Option<FlowNode> {
+        let mut left = self.parse_unary()?;
+        while self.peek() == Some(&Token::And) {
+            self.advance();
+            let right = self.parse_unary()?;
+            left = FlowNode::And(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    /// unary := '!' unary | atom
+    fn parse_unary(&mut self) -> Option<FlowNode> {
+        if self.peek() == Some(&Token::Not) {
+            self.advance();
+            let node = self.parse_unary()?;
+            return Some(FlowNode::Not(Box::new(node)));
+        }
+        self.parse_atom()
+    }
+
+    /// atom := '(' or_expr ')' | call | bool
+    fn parse_atom(&mut self) -> Option<FlowNode> {
+        match self.advance()? {
+            Token::LParen => {
+                let node = self.parse_or()?;
+                if self.advance()? != Token::RParen {
+                    return None;
+                }
+                Some(node)
+            }
+            Token::Call(name, idx) => Some(match name.as_str() {
+                "http" => FlowNode::Http(idx),
+                "dns" => FlowNode::Dns(idx),
+                "network" | "tcp" => FlowNode::Network(idx),
+                "ssl" => FlowNode::Ssl(idx),
+                "code" => FlowNode::Code(idx),
+                _ => return None,
+            }),
+            Token::Bool(b) => Some(FlowNode::Bool(b)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::template::{HttpBlock, TemplateInfo};
 
     #[test]
-    fn test_flow_parsing() {
-        let mut template = NucleiTemplate {
-            id: "flow-test".to_string(),
-            info: TemplateInfo {
-                name: "Flow Test".to_string(),
-                author: Default::default(),
-                severity: "info".to_string(),
-                description: None,
-                reference: None,
-                tags: None,
-                metadata: None,
-                classification: None,
-                remediation: None,
-            },
-            http: vec![HttpBlock {
-                method: Some("GET".to_string()),
-                path: vec!["/".to_string()],
-                raw: vec![],
-                headers: Default::default(),
-                body: None,
-                matchers_condition: None,
-                matchers: vec![],
-                extractors: vec![],
-                stop_at_first_match: false,
-                max_redirects: None,
-                redirects: None,
-                cookie_reuse: None,
-                race: false,
-                race_number: None,
-            }],
-            dns: vec![],
-            network: vec![],
-            ssl: vec![],
-            whois: vec![],
-            file: vec![],
-            code: vec![],
-            websocket: vec![],
-            headless: vec![],
-            javascript: vec![],
-            fuzzing: vec![],
-            flow: Some("http(0)".to_string()),
-            signature: None,
-            self_contained: false,
-            variables: Default::default(),
-            constants: Default::default(),
-        };
+    fn test_parse_simple_and() {
+        let node = parse_flow("http(1) && http(2)").unwrap();
+        assert_eq!(
+            node,
+            FlowNode::And(Box::new(FlowNode::Http(0)), Box::new(FlowNode::Http(1)))
+        );
+    }
 
-        let steps = FlowEngine::parse_flow_steps("http(0)", &template);
-        assert_eq!(steps.len(), 1);
-        match steps[0] {
-            FlowStep::Http(0) => {}
-            _ => panic!("Expected Http(0)"),
-        }
+    #[test]
+    fn test_parse_chain() {
+        let node = parse_flow("http(1) && http(2) && http(3)").unwrap();
+        assert!(matches!(node, FlowNode::And(_, _)));
+    }
+
+    #[test]
+    fn test_parse_or_precedence() {
+        // http(1) || http(2) && http(3)  ==  http(1) || (http(2) && http(3))
+        let node = parse_flow("http(1) || http(2) && http(3)").unwrap();
+        assert_eq!(
+            node,
+            FlowNode::Or(
+                Box::new(FlowNode::Http(0)),
+                Box::new(FlowNode::And(
+                    Box::new(FlowNode::Http(1)),
+                    Box::new(FlowNode::Http(2))
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_parentheses_and_not() {
+        let node = parse_flow("(http(1) && http(2)) || !http(3)").unwrap();
+        assert!(matches!(node, FlowNode::Or(_, _)));
+    }
+
+    #[test]
+    fn test_parse_mixed_protocols() {
+        let node = parse_flow("dns(1) && ssl(1)").unwrap();
+        assert_eq!(
+            node,
+            FlowNode::And(Box::new(FlowNode::Dns(0)), Box::new(FlowNode::Ssl(0)))
+        );
+    }
+
+    #[test]
+    fn test_reject_unsupported_constructs() {
+        assert!(parse_flow("iterate(template.endpoints)").is_none());
+        assert!(parse_flow("set(\"a\", 1)").is_none());
+        assert!(parse_flow("javascript() && http(1)").is_none());
+        assert!(parse_flow("http(0)").is_none());
+        assert!(parse_flow("status_code == 200").is_none());
+        assert!(parse_flow("let x = http(1)").is_none());
     }
 }

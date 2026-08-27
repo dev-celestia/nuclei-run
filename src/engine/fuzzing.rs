@@ -7,7 +7,9 @@ pub struct FuzzRequest {
     pub url: String,
     pub headers: HashMap<String, String>,
     pub body: Option<String>,
+    #[allow(dead_code)]
     pub parameter_name: String,
+    #[allow(dead_code)]
     pub payload_value: String,
 }
 

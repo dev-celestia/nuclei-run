@@ -9,6 +9,17 @@ pub struct EvaluatedResponse<'a> {
     pub status: u16,
     pub headers: &'a str,
     pub body: &'a str,
+    /// Protocol of a recorded Interactsh callback (e.g. "http", "dns").
+    /// `None` when no out-of-band interaction was received for this request.
+    pub interactsh_protocol: Option<&'a str>,
+    /// Raw request of the recorded Interactsh callback.
+    pub interactsh_request: Option<&'a str>,
+    /// Raw response of the recorded Interactsh callback.
+    pub interactsh_response: Option<&'a str>,
+    /// Named dynamic parts (e.g. headless script results keyed by `name:`).
+    /// When a matcher's `part` is not a standard part, it is looked up here
+    /// before falling back to the body.
+    pub named_parts: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 /// High-performance matcher engine supporting word (Aho-Corasick), regex, status,
@@ -19,6 +30,23 @@ impl MatcherEngine {
     /// Evaluate a single matcher against the response.
     /// Returns `true` if the matcher condition is satisfied (accounting for `negative` flag).
     pub fn evaluate(matcher: &TemplateMatcher, resp: &EvaluatedResponse) -> bool {
+        // Interactsh-backed parts only carry data from real out-of-band
+        // interactions. Without a recorded callback the matcher never matches
+        // (nuclei only evaluates these parts when an interaction arrives), so
+        // they must not fall back to the response body — including `negative`
+        // matchers, which would otherwise match every request.
+        if let Some(part) = matcher.part.as_deref() {
+            let interaction_data = match part {
+                "interactsh_protocol" => Some(resp.interactsh_protocol),
+                "interactsh_request" => Some(resp.interactsh_request),
+                "interactsh_response" => Some(resp.interactsh_response),
+                _ => None,
+            };
+            if matches!(interaction_data, Some(None)) {
+                return false;
+            }
+        }
+
         let is_match = match matcher.matcher_type.as_str() {
             "status" => Self::match_status(&matcher.status, resp.status),
             "word" => {
@@ -259,7 +287,21 @@ impl MatcherEngine {
                 Cow::Owned(full)
             }
             "status" => Cow::Borrowed(""), // Status matchers don't use string content.
-            _ => Cow::Borrowed(resp.body), // Default: body
+            // Out-of-band interaction parts — populated only from recorded
+            // Interactsh callbacks, never from the HTTP response itself.
+            "interactsh_protocol" => Cow::Borrowed(resp.interactsh_protocol.unwrap_or("")),
+            "interactsh_request" => Cow::Borrowed(resp.interactsh_request.unwrap_or("")),
+            "interactsh_response" => Cow::Borrowed(resp.interactsh_response.unwrap_or("")),
+            part => {
+                // Named dynamic parts (e.g. headless script results) are looked
+                // up by name before falling back to the body.
+                if let Some(named) = resp.named_parts {
+                    if let Some(value) = named.get(part) {
+                        return Cow::Borrowed(value.as_str());
+                    }
+                }
+                Cow::Borrowed(resp.body) // Default: body
+            }
         }
     }
 
@@ -343,6 +385,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
 
@@ -350,6 +396,10 @@ mod tests {
             status: 404,
             headers: "",
             body: "",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(!MatcherEngine::evaluate(&m, &resp_404));
     }
@@ -363,6 +413,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "Welcome to the admin panel",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
     }
@@ -377,6 +431,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "Welcome to the admin panel",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
 
@@ -384,6 +442,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "Welcome to the admin area",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(!MatcherEngine::evaluate(&m, &resp_partial));
     }
@@ -397,6 +459,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "root:x:0:0:root:/root:/bin/bash",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
     }
@@ -411,6 +477,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "Success! All good.",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
     }
@@ -424,6 +494,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "admin panel active",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
     }
@@ -438,6 +512,10 @@ mod tests {
             status: 200,
             headers: "",
             body: "welcome admin",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
     }
@@ -465,6 +543,10 @@ internal: true
             status: 200,
             headers: "",
             body: "Hello World!", // len = 12
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
 
@@ -472,6 +554,10 @@ internal: true
             status: 200,
             headers: "",
             body: "Wrong",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(!MatcherEngine::evaluate(&m, &resp_wrong));
     }
@@ -485,6 +571,10 @@ internal: true
             status: 200,
             headers: "",
             body: "<users><user role='admin'>Alice</user></users>",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(MatcherEngine::evaluate(&m, &resp));
 
@@ -492,6 +582,10 @@ internal: true
             status: 200,
             headers: "",
             body: "<users><user role='guest'>Bob</user></users>",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
         };
         assert!(!MatcherEngine::evaluate(&m, &resp_no_match));
     }

@@ -152,7 +152,7 @@ fn parse_raw_request(raw: &str, target_url: &str) -> Result<ParsedRawRequest, St
     // Split on double newline to separate headers from body.
     let (header_section, body) = if let Some(pos) = normalized.find("\n\n") {
         let h = &normalized[..pos];
-        let b = normalized[pos + 2..].trim().to_string();
+        let b = normalized[pos + 2..].to_string();
         (h, if b.is_empty() { None } else { Some(b) })
     } else {
         (normalized.as_str(), None)
@@ -176,14 +176,14 @@ fn parse_raw_request(raw: &str, target_url: &str) -> Result<ParsedRawRequest, St
     } else {
         let base = target_url.trim_end_matches('/');
         if path.starts_with('/') {
-            // Extract scheme + host from target URL.
+            // Extract scheme + host(:port) from target URL.
             if let Ok(parsed) = url::Url::parse(target_url) {
-                format!(
-                    "{}://{}{}",
-                    parsed.scheme(),
-                    parsed.host_str().unwrap_or("localhost"),
-                    path
-                )
+                let host = parsed.host_str().unwrap_or("localhost");
+                let authority = match parsed.port() {
+                    Some(port) => format!("{}:{}", host, port),
+                    None => host.to_string(),
+                };
+                format!("{}://{}{}", parsed.scheme(), authority, path)
             } else {
                 format!("{}{}", base, path)
             }

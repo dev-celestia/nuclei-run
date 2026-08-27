@@ -1,7 +1,20 @@
+use crate::engine::crypto_signer::TemplateSigner;
 use crate::models::template::{NucleiTemplate, Severity};
 use serde_yaml;
 use std::path::Path;
 use walkdir::WalkDir;
+
+/// Template signature enforcement mode for `--disable-unsigned-templates`.
+#[derive(Debug, Clone, Default)]
+pub enum SignaturePolicy {
+    /// No signature enforcement (default).
+    #[default]
+    AllowAll,
+    /// Require a `# digest:` line to be present.
+    RequireDigest,
+    /// Require a `# digest:` line and verify it against this key.
+    Verify(ed25519_dalek::VerifyingKey),
+}
 
 /// Filter criteria for selecting templates during loading.
 #[derive(Debug, Clone, Default)]
@@ -12,6 +25,8 @@ pub struct TemplateFilter {
     pub tags: Vec<String>,
     /// Filter by specific template IDs.
     pub ids: Vec<String>,
+    /// Signature enforcement policy.
+    pub signature_policy: SignaturePolicy,
 }
 
 /// Result of loading templates from disk.
@@ -93,12 +108,30 @@ fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoadOut
         Err(e) => return TemplateLoadOutcome::ParseError(e.to_string()),
     };
 
+    // Signature enforcement (--disable-unsigned-templates).
+    match &filter.signature_policy {
+        SignaturePolicy::AllowAll => {}
+        SignaturePolicy::RequireDigest => {
+            if TemplateSigner::extract_digest_hex(&content).is_none() {
+                return TemplateLoadOutcome::Filtered;
+            }
+        }
+        SignaturePolicy::Verify(key) => {
+            let signed = TemplateSigner::extract_digest_hex(&content)
+                .map(|digest| TemplateSigner::verify_content(&content, key, &digest))
+                .unwrap_or(false);
+            if !signed {
+                return TemplateLoadOutcome::Filtered;
+            }
+        }
+    }
+
     let template: NucleiTemplate = match serde_yaml::from_str(&content) {
         Ok(t) => t,
         Err(e) => return TemplateLoadOutcome::ParseError(e.to_string()),
     };
 
-    // Ensure template has at least one executable block
+    // Ensure template has at least one executable block.
     let has_executable_blocks = !template.http.is_empty()
         || !template.dns.is_empty()
         || !template.network.is_empty()
@@ -107,13 +140,23 @@ fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoadOut
         || !template.file.is_empty()
         || !template.code.is_empty()
         || !template.websocket.is_empty()
-        || !template.headless.is_empty()
         || !template.javascript.is_empty()
+        || !template.headless.is_empty()
         || !template.fuzzing.is_empty()
         || template.flow.is_some();
 
     if !has_executable_blocks {
         return TemplateLoadOutcome::Unsupported;
+    }
+
+    // Flow templates whose script uses syntax beyond the supported boolean
+    // subset (loops, functions, iterate/set, etc.) cannot be executed safely:
+    // running their blocks without the gating logic produces false positives,
+    // so they are skipped as unsupported.
+    if let Some(ref flow) = template.flow {
+        if crate::engine::flow::parse_flow(flow).is_none() {
+            return TemplateLoadOutcome::Unsupported;
+        }
     }
 
     // Apply filters.

@@ -57,19 +57,6 @@ impl HostErrorsCache {
     }
 }
 
-/// Detects honeypot responses (e.g. servers returning the same 200 OK body for all non-existent paths).
-pub struct HoneypotDetector;
-
-impl HoneypotDetector {
-    pub fn is_honeypot(responses: &[String]) -> bool {
-        if responses.len() < 3 {
-            return false;
-        }
-        let first = &responses[0];
-        responses.iter().all(|r| r == first && !r.is_empty())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,14 +72,5 @@ mod tests {
 
         cache.record_error("http://dead-host.com").await;
         assert!(cache.is_dropped("http://dead-host.com").await);
-    }
-
-    #[test]
-    fn test_honeypot_detection() {
-        let same = vec!["<html>ok</html>".to_string(), "<html>ok</html>".to_string(), "<html>ok</html>".to_string()];
-        assert!(HoneypotDetector::is_honeypot(&same));
-
-        let diff = vec!["<html>404</html>".to_string(), "<html>200</html>".to_string(), "<html>500</html>".to_string()];
-        assert!(!HoneypotDetector::is_honeypot(&diff));
     }
 }

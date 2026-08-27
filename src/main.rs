@@ -83,8 +83,12 @@ struct Cli {
     #[arg(long = "enable-code-templates")]
     pub enable_code_templates: bool,
 
+    /// Enable headless browser protocol execution (requires Chrome/Chromium)
+    #[arg(long = "headless")]
+    pub headless: bool,
+
     /// Discover targets via Uncover OSINT engines
-    #[arg(short = 'u', long = "uncover", alias = "uc")]
+    #[arg(long = "uncover", alias = "uc")]
     pub uncover: bool,
 
     /// Uncover search query
@@ -100,8 +104,20 @@ struct Cli {
     pub interactsh_server: Option<String>,
 
     /// Maximum consecutive host errors before dropping host (circuit breaker)
-    #[arg(long = "max-host-error", short = 'm', alias = "mhe", default_value = "30")]
+    #[arg(long = "max-host-error", alias = "mhe", default_value = "30")]
     pub max_host_errors: usize,
+
+    /// Detect potential honeypot hosts based on match concentration
+    #[arg(long = "honeypot-detect", alias = "hpd")]
+    pub honeypot_detect: bool,
+
+    /// Distinct template IDs required to flag a honeypot host
+    #[arg(long = "honeypot-threshold", alias = "hpt", default_value = "15")]
+    pub honeypot_threshold: usize,
+
+    /// Suppress output for flagged honeypot hosts
+    #[arg(long = "suppress-honeypot", alias = "shp")]
+    pub suppress_honeypot: bool,
 
     /// Cryptographically sign templates in place with Ed25519
     #[arg(long = "sign")]
@@ -110,6 +126,42 @@ struct Cli {
     /// Refuse executing unsigned templates
     #[arg(long = "disable-unsigned-templates", alias = "duts")]
     pub disable_unsigned_templates: bool,
+
+    /// Path to the Ed25519 signing key (hex); used by --sign and signature verification
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<String>,
+
+    /// Export findings to Elasticsearch (base URL)
+    #[arg(long = "export-elasticsearch")]
+    pub export_elasticsearch: Option<String>,
+
+    /// Elasticsearch index name (default: nuclei-run)
+    #[arg(long = "es-index", default_value = "nuclei-run")]
+    pub es_index: String,
+
+    /// Export findings to Splunk HEC (base URL)
+    #[arg(long = "export-splunk")]
+    pub export_splunk: Option<String>,
+
+    /// Splunk HEC authentication token
+    #[arg(long = "splunk-token")]
+    pub splunk_token: Option<String>,
+
+    /// Export findings to a webhook URL (JSON POST)
+    #[arg(long = "export-webhook")]
+    pub export_webhook: Option<String>,
+
+    /// Create issues for findings: github, gitlab, jira, linear (tokens via env: GITHUB_TOKEN, GITLAB_TOKEN, JIRA_EMAIL + JIRA_API_TOKEN, LINEAR_API_KEY)
+    #[arg(long = "tracker")]
+    pub tracker: Option<String>,
+
+    /// Tracker project: GitHub repo (org/repo), GitLab project ID, Jira project key, or Linear team ID
+    #[arg(long = "tracker-project")]
+    pub tracker_project: Option<String>,
+
+    /// Tracker host URL: Jira instance host or self-hosted GitLab base URL
+    #[arg(long = "tracker-url")]
+    pub tracker_url: Option<String>,
 
     /// Deduplicate identical HTTP requests across templates
     #[arg(long = "cluster-requests")]
@@ -132,9 +184,31 @@ struct Cli {
     pub update_templates: bool,
 }
 
+/// Translate nuclei-style single-dash multi-character flags into long flags
+/// (clap only supports single-character shorts).
+fn translate_legacy_flag(arg: &str) -> String {
+    let (flag, suffix) = match arg.split_once('=') {
+        Some((f, s)) => (f, Some(s)),
+        None => (arg, None),
+    };
+    let mapped = match flag {
+        "-uc" => "--uncover",
+        "-uq" => "--uncover-query",
+        "-ue" => "--uncover-engine",
+        "-mhe" => "--max-host-error",
+        "-duts" => "--disable-unsigned-templates",
+        _ => return arg.to_string(),
+    };
+    match suffix {
+        Some(s) => format!("{}={}", mapped, s),
+        None => mapped.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args().map(|a| translate_legacy_flag(&a)).collect();
+    let cli = Cli::parse_from(args);
 
     // Build scan configuration from CLI args.
     let scan_config = build_config(&cli);
@@ -144,18 +218,107 @@ async fn main() {
         output::stdout::print_banner();
     }
 
+
+    // Handle template signing mode if requested
+    if scan_config.sign_templates {
+        let key_path = scan_config.signing_key_path.as_ref().map(std::path::PathBuf::from);
+        let (signing_key, key_file) =
+            match engine::crypto_signer::TemplateSigner::load_or_create(key_path.as_deref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[ERR] Signing key error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+        eprintln!("[INF] Using signing key: {}", key_file.display());
+
+        let mut signed = 0usize;
+        for t_path in &scan_config.template_paths {
+            let p = std::path::Path::new(t_path);
+            if p.is_file() {
+                match engine::crypto_signer::TemplateSigner::sign_file(p, &signing_key) {
+                    Ok(()) => signed += 1,
+                    Err(e) => eprintln!("[WRN] Failed to sign {}: {}", t_path, e),
+                }
+            } else if p.is_dir() {
+                for entry in walkdir::WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
+                    let fp = entry.path();
+                    let is_yaml = fp
+                        .extension()
+                        .map_or(false, |x| x == "yaml" || x == "yml");
+                    if is_yaml
+                        && engine::crypto_signer::TemplateSigner::sign_file(fp, &signing_key)
+                            .is_ok()
+                    {
+                        signed += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("[INF] Signed {} templates", signed);
+        return;
+    }
+
     // Resolve target URLs.
-    let targets = resolve_targets(&cli);
+    let mut targets = resolve_targets(&cli);
+
+    // OSINT target discovery (uncover).
+    if scan_config.uncover {
+        let Some(query) = scan_config.uncover_query.clone() else {
+            eprintln!("[ERR] -uc requires a query via -uq <query>");
+            std::process::exit(1);
+        };
+        let engine = scan_config
+            .uncover_engine
+            .clone()
+            .unwrap_or_else(|| "shodan".to_string());
+        let opts = engine::uncover::UncoverOptions {
+            engine,
+            query,
+            limit: 100,
+        };
+        match engine::uncover::UncoverClient::query(&opts).await {
+            Ok(discovered) => {
+                eprintln!("[INF] Uncover discovered {} targets", discovered.len());
+                targets.extend(discovered.into_iter().map(|t| normalize_url(&t)));
+            }
+            Err(e) => {
+                eprintln!("[ERR] Uncover query failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if targets.is_empty() {
-        eprintln!("{}", "[ERR] No targets specified. Use -u <url> or -l <file>");
+        eprintln!("{}", "[ERR] No targets specified. Use -u <url>, -l <file>, or -uc OSINT discovery");
         std::process::exit(1);
     }
 
     // Load templates.
+    let signature_policy = if scan_config.disable_unsigned_templates {
+        let key_path = scan_config
+            .signing_key_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let default = engine::crypto_signer::TemplateSigner::default_key_path();
+                default.exists().then_some(default)
+            });
+        match key_path.and_then(|p| {
+            engine::crypto_signer::TemplateSigner::load_verifying_key(&p).ok()
+        }) {
+            Some(key) => yaml_loader::SignaturePolicy::Verify(key),
+            None => yaml_loader::SignaturePolicy::RequireDigest,
+        }
+    } else {
+        yaml_loader::SignaturePolicy::AllowAll
+    };
+
     let filter = TemplateFilter {
         severities: scan_config.severity_filter.clone(),
         tags: scan_config.tag_filter.clone(),
         ids: scan_config.id_filter.clone(),
+        signature_policy,
     };
 
     // Resolve template paths (download remote URLs if needed).
@@ -208,19 +371,6 @@ async fn main() {
         output::stdout::print_target_summary(targets.len());
     }
 
-    // Handle template signing mode if requested
-    if scan_config.sign_templates {
-        let (signing_key, _) = engine::crypto_signer::TemplateSigner::generate_keypair();
-        for t_path in &scan_config.template_paths {
-            let p = std::path::Path::new(t_path);
-            if p.is_file() {
-                let _ = engine::crypto_signer::TemplateSigner::sign_file(p, &signing_key);
-                eprintln!("[INF] Signed template: {}", t_path);
-            }
-        }
-        return;
-    }
-
     // Build scan tasks: each (target, template) pair.
     let templates_arc: Vec<Arc<models::template::NucleiTemplate>> =
         all_templates.into_iter().map(Arc::new).collect();
@@ -232,6 +382,30 @@ async fn main() {
             eprintln!("[INF] Clustered into {} distinct HTTP requests across {} templates", clusters.len(), templates_arc.len());
         }
     }
+
+    // Initialize the Interactsh OOB client when any template needs it.
+    let interactsh_client = if templates_need_interactsh(&templates_arc) {
+        match engine::interactsh::InteractshClient::new(
+            scan_config.interactsh_server.as_deref(),
+            None,
+        ) {
+            Ok(client) => {
+                if !scan_config.silent {
+                    eprintln!(
+                        "[INF] Using Interactsh Server: {}",
+                        client.hostname()
+                    );
+                }
+                Some(client)
+            }
+            Err(e) => {
+                eprintln!("[WRN] Could not initialize Interactsh client: {} (OOB disabled)", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut tasks = Vec::new();
     for target in &targets {
@@ -252,11 +426,22 @@ async fn main() {
         scan_config.proxy.as_deref(),
         &scan_config.custom_headers,
         scan_config.enable_code_templates,
+        scan_config.headless,
         scan_config.max_host_errors,
+        interactsh_client,
     ));
 
     // Set up finding channel.
     let (finding_tx, mut finding_rx) = tokio::sync::mpsc::channel(1000);
+
+    // Graceful cancellation on Ctrl-C.
+    let cancel_engine = Arc::clone(&engine);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n[INF] Interrupt received, stopping scan gracefully...");
+            cancel_engine.cancel();
+        }
+    });
 
     // Start the scan.
     let start_time = std::time::Instant::now();
@@ -281,7 +466,60 @@ async fn main() {
 
     let mut severity_counts: HashMap<String, usize> = HashMap::new();
 
+    // Configure remote exporters and issue tracker from CLI options.
+    let mut exporter_targets: Vec<output::exporter::ExporterTarget> = Vec::new();
+    if let Some(ref url) = scan_config.export_elasticsearch {
+        exporter_targets.push(output::exporter::ExporterTarget::Elasticsearch {
+            url: url.clone(),
+            index: scan_config.es_index.clone(),
+        });
+    }
+    if let Some(ref url) = scan_config.export_splunk {
+        exporter_targets.push(output::exporter::ExporterTarget::SplunkHec {
+            url: url.clone(),
+            token: scan_config.splunk_token.clone().unwrap_or_default(),
+        });
+    }
+    if let Some(ref url) = scan_config.export_webhook {
+        exporter_targets.push(output::exporter::ExporterTarget::Webhook { url: url.clone() });
+    }
+    let exporter = if exporter_targets.is_empty() {
+        None
+    } else {
+        Some(output::exporter::RemoteExporter::new())
+    };
+
+    let tracker_target = build_tracker_target(&scan_config);
+    let issue_tracker = if tracker_target.is_some() {
+        Some(output::issue_tracker::IssueTrackerClient::new())
+    } else {
+        None
+    };
+
+    // Honeypot detection (opt-in).
+    let mut honeypot_detector = if scan_config.honeypot_detect {
+        Some(engine::honeypot::Detector::new(scan_config.honeypot_threshold))
+    } else {
+        None
+    };
+
     while let Some(finding) = finding_rx.recv().await {
+        // Honeypot detection / suppression: record the match, warn when a host
+        // crosses the threshold, and drop results for flagged hosts when
+        // --suppress-honeypot is set.
+        if let Some(ref mut detector) = honeypot_detector {
+            if detector.record_match(&finding.matched_url, &finding.template_id) {
+                eprintln!(
+                    "[WRN] Potential honeypot detected: {} (matched {} distinct templates)",
+                    engine::honeypot::Detector::normalize_host_key(&finding.matched_url),
+                    detector.threshold()
+                );
+            }
+            if scan_config.suppress_honeypot && detector.is_flagged(&finding.matched_url) {
+                continue;
+            }
+        }
+
         // Print to stdout (unless writing JSONL to stdout in non-silent mode).
         if !scan_config.silent && !(scan_config.jsonl && scan_config.output_path.is_none()) {
             output::stdout::print_finding(&finding);
@@ -290,6 +528,22 @@ async fn main() {
         // Write JSONL if enabled.
         if let Some(ref mut writer) = jsonl_writer {
             let _ = writer.write_finding(&finding);
+        }
+
+        // Export to remote SIEM / webhook destinations.
+        if let Some(ref exporter) = exporter {
+            for target in &exporter_targets {
+                if let Err(e) = exporter.export(&finding, target).await {
+                    eprintln!("[WRN] Export failed: {}", e);
+                }
+            }
+        }
+
+        // Create an issue in the configured tracker.
+        if let (Some(ref tracker), Some(ref target)) = (&issue_tracker, &tracker_target) {
+            if let Err(e) = tracker.create_issue(&finding, target).await {
+                eprintln!("[WRN] Issue tracker failed: {}", e);
+            }
         }
 
         // Track severity counts.
@@ -351,6 +605,9 @@ async fn main() {
     }
 
     if !scan_config.silent {
+        if let Some(ref detector) = honeypot_detector {
+            eprintln!("[INF] {}", detector.summary());
+        }
         output::stdout::print_summary(&summary);
     }
 
@@ -398,13 +655,26 @@ fn build_config(cli: &Cli) -> ScanConfig {
         output_path: cli.output.clone(),
         markdown_export: cli.markdown_export.clone(),
         enable_code_templates: cli.enable_code_templates,
+        headless: cli.headless,
         uncover: cli.uncover,
         uncover_query: cli.uncover_query.clone(),
         uncover_engine: cli.uncover_engine.clone(),
         interactsh_server: cli.interactsh_server.clone(),
         max_host_errors: cli.max_host_errors,
+        honeypot_detect: cli.honeypot_detect,
+        honeypot_threshold: cli.honeypot_threshold,
+        suppress_honeypot: cli.suppress_honeypot,
         sign_templates: cli.sign,
         disable_unsigned_templates: cli.disable_unsigned_templates,
+        signing_key_path: cli.signing_key.clone(),
+        export_elasticsearch: cli.export_elasticsearch.clone(),
+        es_index: cli.es_index.clone(),
+        export_splunk: cli.export_splunk.clone(),
+        splunk_token: cli.splunk_token.clone(),
+        export_webhook: cli.export_webhook.clone(),
+        tracker: cli.tracker.clone(),
+        tracker_project: cli.tracker_project.clone(),
+        tracker_url: cli.tracker_url.clone(),
         cluster_requests: cli.cluster_requests,
         jsonl: cli.jsonl,
         sarif: cli.sarif,
@@ -469,8 +739,88 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
+/// Build the issue tracker destination from CLI options and env tokens.
+fn build_tracker_target(config: &ScanConfig) -> Option<output::issue_tracker::IssueTrackerTarget> {
+    use output::issue_tracker::IssueTrackerTarget;
+
+    let kind = config.tracker.as_deref()?.to_lowercase();
+    let project = config.tracker_project.clone().unwrap_or_default();
+    if project.is_empty() {
+        eprintln!("[WRN] --tracker requires --tracker-project; issue creation disabled");
+        return None;
+    }
+
+    fn missing(name: &str) {
+        eprintln!("[WRN] Tracker disabled: {} environment variable not set", name);
+    }
+
+    match kind.as_str() {
+        "github" => match std::env::var("GITHUB_TOKEN") {
+            Ok(token) => Some(IssueTrackerTarget::GitHub { repo: project, token }),
+            Err(_) => {
+                missing("GITHUB_TOKEN");
+                None
+            }
+        },
+        "gitlab" => match std::env::var("GITLAB_TOKEN") {
+            Ok(token) => Some(IssueTrackerTarget::GitLab {
+                project_id: project,
+                token,
+                base_url: config.tracker_url.clone(),
+            }),
+            Err(_) => {
+                missing("GITLAB_TOKEN");
+                None
+            }
+        },
+        "jira" => {
+            let Some(host) = config.tracker_url.clone() else {
+                eprintln!("[WRN] Tracker disabled: jira requires --tracker-url (instance host)");
+                return None;
+            };
+            match (std::env::var("JIRA_EMAIL"), std::env::var("JIRA_API_TOKEN")) {
+                (Ok(user_email), Ok(api_token)) => Some(IssueTrackerTarget::Jira {
+                    host,
+                    project_key: project,
+                    user_email,
+                    api_token,
+                }),
+                _ => {
+                    missing("JIRA_EMAIL / JIRA_API_TOKEN");
+                    None
+                }
+            }
+        }
+        "linear" => match std::env::var("LINEAR_API_KEY") {
+            Ok(api_key) => Some(IssueTrackerTarget::Linear { team_id: project, api_key }),
+            Err(_) => {
+                missing("LINEAR_API_KEY");
+                None
+            }
+        },
+        other => {
+            eprintln!("[WRN] Unknown tracker '{}'; issue creation disabled", other);
+            None
+        }
+    }
+}
+
 /// Simple check if stdin is not a terminal (for pipe detection).
 fn atty_is_not_terminal() -> bool {
     // Use a simple heuristic: try to detect if we're connected to a pipe.
     !std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
+
+/// Returns true when any loaded template uses `{{interactsh-url}}` markers and
+/// therefore needs the OOB correlation client.
+fn templates_need_interactsh(templates: &[Arc<models::template::NucleiTemplate>]) -> bool {
+    const MARKER: &str = "{{interactsh-url}}";
+    templates.iter().any(|t| {
+        t.http.iter().any(|b| {
+            b.raw.iter().any(|r| r.contains(MARKER))
+                || b.path.iter().any(|p| p.contains(MARKER))
+                || b.body.as_deref().map_or(false, |body| body.contains(MARKER))
+                || b.headers.values().any(|v| v.contains(MARKER))
+        })
+    })
 }

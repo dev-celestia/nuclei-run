@@ -5,9 +5,13 @@ use std::sync::Arc;
 /// A clustered request unit combining multiple templates that share identical HTTP paths/methods.
 #[derive(Debug, Clone)]
 pub struct ClusteredTask {
+    #[allow(dead_code)]
     pub target: String,
+    #[allow(dead_code)]
     pub path: String,
+    #[allow(dead_code)]
     pub method: String,
+    #[allow(dead_code)]
     pub templates: Vec<Arc<NucleiTemplate>>,
 }
 
