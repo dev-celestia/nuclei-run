@@ -2,6 +2,7 @@ use crate::engine::dsl::TemplateDsl;
 use crate::models::template::TemplateMatcher;
 use aho_corasick::AhoCorasick;
 use regex::Regex;
+use std::borrow::Cow;
 
 /// Response data prepared for matcher evaluation.
 pub struct EvaluatedResponse<'a> {
@@ -29,17 +30,17 @@ impl MatcherEngine {
                         matcher.words.iter().map(|w| w.to_lowercase()).collect();
                     Self::match_words(&lower_words, &lower_content, condition)
                 } else {
-                    Self::match_words(&matcher.words, content, condition)
+                    Self::match_words(&matcher.words, &content, condition)
                 }
             }
             "regex" => {
                 let content = Self::get_part(matcher, resp);
                 let condition = Self::parse_condition(matcher);
-                Self::match_regex(&matcher.regex, content, condition, matcher.case_insensitive)
+                Self::match_regex(&matcher.regex, &content, condition, matcher.case_insensitive)
             }
             "binary" => {
                 let content = Self::get_part(matcher, resp);
-                Self::match_binary(&matcher.binary, content)
+                Self::match_binary(&matcher.binary, &content)
             }
             "dsl" => Self::match_dsl(&matcher.dsl, resp),
             _ => false,
@@ -177,16 +178,21 @@ impl MatcherEngine {
     // -----------------------------------------------------------------------
 
     /// Select the response part to match against based on the matcher's `part` field.
-    fn get_part<'a>(matcher: &TemplateMatcher, resp: &'a EvaluatedResponse) -> &'a str {
+    /// Returns a `Cow<str>` so "response" can concatenate headers + body without
+    /// requiring all callers to allocate.
+    fn get_part<'a>(matcher: &TemplateMatcher, resp: &'a EvaluatedResponse) -> Cow<'a, str> {
         match matcher.part.as_deref().unwrap_or("body") {
-            "header" | "all_headers" => resp.headers,
+            "header" | "all_headers" => Cow::Borrowed(resp.headers),
             "response" => {
-                // "response" means the full response (headers + body).
-                // We'll match against body as a fallback since we don't concatenate.
-                resp.body
+                // "response" means the full HTTP response (headers + body).
+                let mut full = String::with_capacity(resp.headers.len() + resp.body.len() + 1);
+                full.push_str(resp.headers);
+                full.push('\n');
+                full.push_str(resp.body);
+                Cow::Owned(full)
             }
-            "status" => "", // Status matchers don't use string content.
-            _ => resp.body, // Default: body
+            "status" => Cow::Borrowed(""), // Status matchers don't use string content.
+            _ => Cow::Borrowed(resp.body), // Default: body
         }
     }
 

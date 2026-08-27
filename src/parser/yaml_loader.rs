@@ -1,4 +1,5 @@
 use crate::models::template::{NucleiTemplate, Severity};
+use serde_yaml;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -98,6 +99,16 @@ fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoadOut
         return TemplateLoadOutcome::Unsupported;
     }
 
+    // Skip templates that require interactsh OOB callbacks (unsupported).
+    if requires_interactsh(&content) {
+        return TemplateLoadOutcome::Unsupported;
+    }
+
+    // Skip templates with flow control (unsupported multi-step orchestration).
+    if has_flow_control(&content) {
+        return TemplateLoadOutcome::Unsupported;
+    }
+
     let template: NucleiTemplate = match serde_yaml::from_str(&content) {
         Ok(t) => t,
         Err(e) => return TemplateLoadOutcome::ParseError(e.to_string()),
@@ -135,6 +146,27 @@ fn has_unsupported_protocol(content: &str) -> bool {
             {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// Check if the template requires interactsh OOB (out-of-band) callbacks.
+/// These templates rely on a callback server to verify SSRF/RCE and cannot
+/// be accurately evaluated without one — they produce false positives.
+fn requires_interactsh(content: &str) -> bool {
+    content.contains("interactsh-url")
+        || content.contains("interactsh_url")
+        || content.contains("oast.")
+}
+
+/// Check if the template uses flow control expressions (Nuclei v3+).
+/// These require JavaScript-based orchestration that isn't supported yet.
+fn has_flow_control(content: &str) -> bool {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if line == trimmed && trimmed.starts_with("flow:") {
+            return true;
         }
     }
     false

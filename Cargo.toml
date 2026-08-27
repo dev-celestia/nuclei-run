@@ -49,6 +49,8 @@ async-trait = "0.1"
 
 # Misc
 thiserror = "2"
+zip = { version = "8.6.0", features = ["deflate"] }
+tempfile = "3.27.0"
 
 [profile.release]
 opt-level = 3

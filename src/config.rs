@@ -49,4 +49,7 @@ pub struct ScanConfig {
 
     /// Silent mode: suppress banner, progress, and summary.
     pub silent: bool,
+
+    /// Force re-download of remote templates (bypass cache).
+    pub update_templates: bool,
 }

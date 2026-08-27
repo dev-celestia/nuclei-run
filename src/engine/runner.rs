@@ -11,6 +11,26 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Check if a string still contains unresolved Nuclei template variables.
+/// These look like `{{variable_name}}` and indicate the DSL engine couldn't
+/// resolve them — sending such requests produces false positives.
+fn has_unresolved_variables(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        if let Some(end) = rest[start..].find("}}") {
+            let inner = &rest[start + 2..start + end];
+            // Skip empty braces and known URL-safe patterns.
+            if !inner.is_empty() && !inner.contains("http") {
+                return true;
+            }
+            rest = &rest[start + end + 2..];
+        } else {
+            break;
+        }
+    }
+    false
+}
+
 /// A unit of work: one target URL × one template.
 pub struct ScanTask {
     pub target: String,
@@ -199,6 +219,19 @@ impl EngineRunner {
             for req_spec in requests_to_send {
                 if self.is_cancelled.load(Ordering::Relaxed) {
                     return;
+                }
+
+                // Skip requests with unresolved template variables — these would
+                // hit the target with garbage URLs and produce false positives.
+                let has_unresolved = match &req_spec {
+                    RequestSpec::Standard { url, body, .. } => {
+                        has_unresolved_variables(url)
+                            || body.as_ref().map_or(false, |b| has_unresolved_variables(b))
+                    }
+                    RequestSpec::Raw(raw_content) => has_unresolved_variables(raw_content),
+                };
+                if has_unresolved {
+                    continue;
                 }
 
                 self.request_counter.fetch_add(1, Ordering::Relaxed);

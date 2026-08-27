@@ -86,6 +86,10 @@ struct Cli {
     /// Silent mode: suppress banner and progress
     #[arg(long = "silent")]
     silent: bool,
+
+    /// Force re-download of remote templates (bypass cache)
+    #[arg(long = "update-templates", short = 'U')]
+    update_templates: bool,
 }
 
 #[tokio::main]
@@ -114,14 +118,30 @@ async fn main() {
         ids: scan_config.id_filter.clone(),
     };
 
+    // Resolve template paths (download remote URLs if needed).
+    let mut resolved_handles = Vec::new();
+    let mut resolved_paths = Vec::new();
+
+    for path in &scan_config.template_paths {
+        match parser::template_resolver::resolve_template_path(path, scan_config.update_templates).await {
+            Ok(resolved) => {
+                resolved_paths.push(resolved.local_path.clone());
+                resolved_handles.push(resolved);
+            }
+            Err(e) => {
+                eprintln!("[ERR] Failed to resolve template path '{}': {}", path, e);
+            }
+        }
+    }
+
     let mut all_templates = Vec::new();
     let mut total_scanned = 0;
     let mut total_unsupported = 0;
     let mut total_errors = 0;
     let mut total_filtered = 0;
 
-    for path in &scan_config.template_paths {
-        let result = yaml_loader::load_templates(path, &filter);
+    for path in &resolved_paths {
+        let result = yaml_loader::load_templates(&path.to_string_lossy(), &filter);
         total_scanned += result.total_files_scanned;
         total_unsupported += result.skipped_unsupported;
         total_errors += result.skipped_parse_errors;
@@ -306,6 +326,7 @@ fn build_config(cli: &Cli) -> ScanConfig {
         jsonl: cli.jsonl,
         sarif: cli.sarif,
         silent: cli.silent,
+        update_templates: cli.update_templates,
     }
 }
 
