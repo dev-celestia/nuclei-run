@@ -1,6 +1,11 @@
+pub mod extractors;
+pub mod parts;
+
+pub use extractors::{extract_json_path, extract_regex, extract_xpath};
+pub use parts::get_content;
+
 use crate::engine::http_client::HttpResponse;
 use crate::models::template::TemplateExtractor;
-use regex::Regex;
 use std::collections::HashMap;
 
 /// Extractor engine that pulls values from HTTP responses.
@@ -22,8 +27,8 @@ impl ExtractorEngine {
 
         match extractor.extractor_type.as_str() {
             "regex" => {
-                let content = Self::get_content(extractor, response);
-                if let Some(value) = Self::extract_regex(
+                let content = get_content(extractor, response);
+                if let Some(value) = extract_regex(
                     &extractor.regex,
                     &content,
                     extractor.regex_group.unwrap_or(0),
@@ -45,9 +50,9 @@ impl ExtractorEngine {
                 }
             }
             "json" => {
-                let content = Self::get_content(extractor, response);
+                let content = get_content(extractor, response);
                 for path in &extractor.json {
-                    if let Some(value) = Self::extract_json_path(&content, path) {
+                    if let Some(value) = extract_json_path(&content, path) {
                         let json_name = if extractor.json.len() == 1 {
                             name.clone()
                         } else {
@@ -58,9 +63,9 @@ impl ExtractorEngine {
                 }
             }
             "xpath" => {
-                let content = Self::get_content(extractor, response);
+                let content = get_content(extractor, response);
                 for path in &extractor.xpath {
-                    if let Some(value) = Self::extract_xpath(&content, path, extractor.attribute.as_deref()) {
+                    if let Some(value) = extract_xpath(&content, path, extractor.attribute.as_deref()) {
                         let xpath_name = if extractor.xpath.len() == 1 {
                             name.clone()
                         } else {
@@ -71,7 +76,7 @@ impl ExtractorEngine {
                 }
             }
             "dsl" => {
-                let content = Self::get_content(extractor, response);
+                let content = get_content(extractor, response);
                 for dsl_expr in &extractor.dsl {
                     let val = crate::engine::dsl::TemplateDsl::interpolate(dsl_expr, &content, &HashMap::new());
                     results.insert(name.clone(), val);
@@ -116,91 +121,6 @@ impl ExtractorEngine {
         }
         values
     }
-
-    // -----------------------------------------------------------------------
-    // Regex Extraction
-    // -----------------------------------------------------------------------
-
-    fn extract_regex(patterns: &[String], text: &str, group: usize) -> Option<String> {
-        for pat in patterns {
-            if let Ok(re) = Regex::new(pat) {
-                if let Some(caps) = re.captures(text) {
-                    // Try to get the specified capture group, fall back to full match.
-                    if let Some(m) = caps.get(group) {
-                        return Some(m.as_str().to_string());
-                    } else if let Some(m) = caps.get(0) {
-                        return Some(m.as_str().to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    // -----------------------------------------------------------------------
-    // JSON Path Extraction (basic dot-notation)
-    // -----------------------------------------------------------------------
-
-    fn extract_json_path(json_text: &str, path: &str) -> Option<String> {
-        let parsed: serde_json::Value = serde_json::from_str(json_text).ok()?;
-
-        let mut current = &parsed;
-        for key in path.trim_start_matches('.').split('.') {
-            // Handle array indexing: key[0]
-            if let Some(bracket_pos) = key.find('[') {
-                let field = &key[..bracket_pos];
-                let index_str = &key[bracket_pos + 1..key.len() - 1];
-                let index: usize = index_str.parse().ok()?;
-
-                if !field.is_empty() {
-                    current = current.get(field)?;
-                }
-                current = current.get(index)?;
-            } else {
-                current = current.get(key)?;
-            }
-        }
-
-        Some(match current {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Null => "null".to_string(),
-            other => other.to_string(),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // XPath Extraction
-    // -----------------------------------------------------------------------
-
-    fn extract_xpath(xml_text: &str, path: &str, _attribute: Option<&str>) -> Option<String> {
-        let package = sxd_document::parser::parse(xml_text).ok()?;
-        let document = package.as_document();
-        let factory = sxd_xpath::Factory::new();
-        let xpath = factory.build(path).ok()??;
-        let context = sxd_xpath::Context::new();
-        let value = xpath.evaluate(&context, document.root()).ok()?;
-        Some(match value {
-            sxd_xpath::Value::Nodeset(nodes) => {
-                let first = nodes.document_order().into_iter().next()?;
-                first.string_value()
-            }
-            sxd_xpath::Value::String(s) => s,
-            sxd_xpath::Value::Number(n) => n.to_string(),
-            sxd_xpath::Value::Boolean(b) => b.to_string(),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Content Selection
-    // -----------------------------------------------------------------------
-
-    fn get_content(extractor: &TemplateExtractor, response: &HttpResponse) -> String {
-        match extractor.part.as_deref().unwrap_or("body") {
-            "header" | "all_headers" => response.headers_raw.clone(),
-            "response" => format!("{}\n{}", response.headers_raw, response.body),
-            _ => response.body.clone(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -218,6 +138,7 @@ mod tests {
             body: r#"{"user": "admin", "role": "superuser", "tokens": ["abc", "def"]}"#
                 .to_string(),
             headers_map,
+            duration_secs: 0.0,
         }
     }
 

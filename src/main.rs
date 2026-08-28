@@ -428,6 +428,7 @@ async fn main() {
         scan_config.enable_code_templates,
         scan_config.headless,
         scan_config.max_host_errors,
+        scan_config.retries,
         interactsh_client,
     ));
 

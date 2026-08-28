@@ -545,7 +545,7 @@ pub struct HeadlessBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadlessStep {
-    /// Action: "navigate", "click", "type", "wait-for", "script", "screenshot", "extract".
+    /// Action: "navigate", "click", "type", "text", "wait-for", "waitload", "script", "screenshot", "setheader", "extract", "keyboard", "select", "sleep".
     #[serde(default, rename = "action")]
     pub action: String,
 
@@ -554,11 +554,11 @@ pub struct HeadlessStep {
     pub name: Option<String>,
 
     /// Target URL or CSS selector.
-    #[serde(default)]
+    #[serde(default, alias = "by", alias = "selector")]
     pub target: Option<String>,
 
     /// Script source for action: "script".
-    #[serde(default, rename = "code")]
+    #[serde(default, rename = "code", alias = "script", alias = "source")]
     pub code: Option<String>,
 
     /// Key/Value pairs for form typing or headers.
@@ -567,6 +567,14 @@ pub struct HeadlessStep {
 
     #[serde(default)]
     pub value: Option<String>,
+
+    /// Custom headers for action: "setheader".
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+
+    /// Attribute name to extract for action: "extract" (e.g. "href", "src", "value").
+    #[serde(default)]
+    pub attribute: Option<String>,
 
     /// Extra arguments (nuclei defines these as a string map,
     /// e.g. `args: {url: "..."}` for the navigate action).

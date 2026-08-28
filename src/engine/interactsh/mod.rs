@@ -1,24 +1,23 @@
 //! Live Interactsh OOB client implementing the projectdiscovery/interactsh
 //! wire protocol (reference: interactsh v1.3.x `pkg/client`).
-//!
-//! - Registration: `POST /register` with a base64 PKCS#1 "RSA PUBLIC KEY" PEM,
-//!   a random secret key and correlation ID. Re-registered periodically as
-//!   keepalive (the server evicts sessions).
-//! - URL generation: `<correlation-id><nonce>.<server-host>` where the nonce is
-//!   13 z-base-32 characters (nuclei correlates on the full first DNS label).
-//! - Polling: `GET /poll?id=<correlation-id>&secret=<secret-key>` every 5s;
-//!   each `data` entry is base64 → AES-CTR decrypted with the AES key recovered
-//!   via RSA-OAEP-SHA256 decryption of `aes_key`.
-//! - Correlation: `Interaction.unique-id` equals the first label of the
-//!   generated URL; pending request contexts are keyed by that label.
+
+pub mod crypto;
+pub mod session;
+pub mod url;
+
+#[allow(unused_imports)]
+pub use crypto::{decrypt_message, Aes128Ctr, Aes256Ctr};
+#[allow(unused_imports)]
+pub use session::{CorrelationState, Interaction, PendingRequest, PollResponse, RegisterRequest};
+#[allow(unused_imports)]
+pub use url::{random_string, zbase32_nonce, CORRELATION_ID_LEN, DEFAULT_SERVERS, KEEPALIVE_INTERVAL, NONCE_LEN, ZBASE32_ALPHABET};
 
 use crate::engine::matcher::{EvaluatedResponse, MatcherEngine};
 use crate::models::result::ScanFinding;
-use crate::models::template::{TemplateExtractor, TemplateMatcher};
+use crate::models::template::TemplateExtractor;
 use base64::{engine::general_purpose, Engine as _};
-use ctr::cipher::{KeyIvInit, StreamCipher};
 use rand::Rng;
-use rsa::pkcs1::EncodeRsaPublicKey;
+use rsa::pkcs8::EncodePublicKey;
 use rsa::{Oaep, RsaPrivateKey};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -26,92 +25,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
-
-type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
-type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
-
-/// Default public Interactsh servers (mirrors the Go client default list).
-const DEFAULT_SERVERS: &[&str] = &[
-    "oast.pro",
-    "oast.live",
-    "oast.site",
-    "oast.online",
-    "oast.fun",
-    "oast.me",
-];
-
-const CORRELATION_ID_LEN: usize = 20;
-const NONCE_LEN: usize = 13;
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
-const ZBASE32_ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
-
-/// An out-of-band interaction event recorded by the Interactsh server.
-/// `full_id`, `q_type`, `smtp_from` and `remote_address` are kept for wire
-/// completeness (nuclei surfaces them in debug output).
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-pub struct Interaction {
-    #[serde(rename = "protocol", default)]
-    pub protocol: String,
-    #[serde(rename = "unique-id", default)]
-    pub unique_id: String,
-    #[serde(rename = "full-id", default)]
-    pub full_id: String,
-    #[serde(rename = "q-type", default)]
-    pub q_type: String,
-    #[serde(rename = "raw-request", default)]
-    pub raw_request: String,
-    #[serde(rename = "raw-response", default)]
-    pub raw_response: String,
-    #[serde(rename = "smtp-from", default)]
-    pub smtp_from: String,
-    #[serde(rename = "remote-address", default)]
-    pub remote_address: String,
-}
-
-#[derive(serde::Deserialize)]
-struct PollResponse {
-    #[serde(default)]
-    data: Vec<String>,
-    #[serde(default, rename = "aes_key")]
-    aes_key: String,
-}
-
-#[derive(serde::Serialize)]
-struct RegisterRequest<'a> {
-    #[serde(rename = "public-key")]
-    public_key: &'a str,
-    #[serde(rename = "secret-key")]
-    secret_key: &'a str,
-    #[serde(rename = "correlation-id")]
-    correlation_id: &'a str,
-}
-
-/// Everything needed to evaluate a block's matchers and emit a finding when an
-/// interaction arrives for a generated correlation URL.
-pub struct PendingRequest {
-    pub template_id: String,
-    pub template_name: String,
-    pub severity: String,
-    pub tags: Option<String>,
-    pub matched_url: String,
-    /// Saved HTTP response context (status/headers/body) of the request that
-    /// carried the interactsh URL — interactsh matchers may combine OOB parts
-    /// with response parts.
-    pub status: u16,
-    pub headers: String,
-    pub body: String,
-    pub matchers_condition: String,
-    pub matchers: Vec<TemplateMatcher>,
-    pub extractors: Vec<TemplateExtractor>,
-}
-
-struct CorrelationState {
-    /// First DNS label of generated URL → pending request contexts.
-    requests: HashMap<String, Vec<Arc<PendingRequest>>>,
-    /// Interactions that arrived before their request was registered.
-    early_interactions: HashMap<String, Vec<Interaction>>,
-}
 
 /// Live Interactsh session: registration, URL generation, polling, decryption.
 pub struct InteractshClient {
@@ -149,15 +62,21 @@ impl InteractshClient {
         let private_key = RsaPrivateKey::new(&mut rng, 2048).map_err(|e| e.to_string())?;
         let public_key = rsa::RsaPublicKey::from(&private_key);
 
-        // Interactsh expects base64(PEM) where the PEM block is PKCS#1
-        // "RSA PUBLIC KEY".
-        let pem = public_key
-            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
-            .map_err(|e| e.to_string())?;
+        // Match the reference client exactly: PKIX (SubjectPublicKeyInfo) DER
+        // wrapped in a PEM block labeled "RSA PUBLIC KEY", then base64-encoded.
+        let der = public_key.to_public_key_der().map_err(|e| e.to_string())?;
+        let der_b64 = general_purpose::STANDARD.encode(der.as_ref());
+        let mut pem = String::from("-----BEGIN RSA PUBLIC KEY-----\n");
+        for chunk in der_b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            pem.push('\n');
+        }
+        pem.push_str("-----END RSA PUBLIC KEY-----\n");
         let public_key_b64 = general_purpose::STANDARD.encode(pem.as_bytes());
 
         let correlation_id = random_string(CORRELATION_ID_LEN);
-        let secret_key = random_string(CORRELATION_ID_LEN);
+        // The reference client uses a UUID for the secret key.
+        let secret_key = uuid::Uuid::new_v4().to_string();
 
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -303,11 +222,11 @@ impl InteractshClient {
 
     /// Poll once: decrypt and correlate all pending interactions.
     async fn poll_once(&self) -> Vec<(Interaction, Vec<Arc<PendingRequest>>)> {
-        let url = format!(
+        let url_endpoint = format!(
             "{}/poll?id={}&secret={}",
             self.server_url, self.correlation_id, self.secret_key
         );
-        let mut request = self.http.get(&url);
+        let mut request = self.http.get(&url_endpoint);
         if let Some(token) = &self.token {
             request = request.header("Authorization", token.clone());
         }
@@ -406,7 +325,7 @@ impl InteractshClient {
         } else {
             format!("https://{}", server)
         };
-        let parsed = url::Url::parse(&with_scheme)
+        let parsed = ::url::Url::parse(&with_scheme)
             .map_err(|_| format!("invalid interactsh server: {}", server))?;
         let host = parsed
             .host_str()
@@ -436,6 +355,7 @@ pub fn evaluate_interaction(
         interactsh_request: Some(&interaction.raw_request),
         interactsh_response: Some(&interaction.raw_response),
         named_parts: None,
+        duration_secs: 0.0,
     };
 
     if !MatcherEngine::evaluate_all(&pending.matchers, &pending.matchers_condition, &eval) {
@@ -458,7 +378,7 @@ pub fn evaluate_interaction(
 /// Run non-internal extractors over the interaction parts. Supports regex and
 /// simple word extraction over interactsh_protocol/request/response and the
 /// saved response body/headers.
-fn extract_interactsh_output(
+pub fn extract_interactsh_output(
     extractors: &[TemplateExtractor],
     eval: &EvaluatedResponse,
     interaction: &Interaction,
@@ -509,55 +429,6 @@ fn extract_interactsh_output(
     }
 
     results
-}
-
-/// Decrypt one poll `data` entry: base64 → AES-CTR with prefixed 16-byte IV.
-fn decrypt_message(key: &[u8], secure_message: &str) -> Result<Vec<u8>, String> {
-    let mut cipher_text = general_purpose::STANDARD
-        .decode(secure_message)
-        .map_err(|e| e.to_string())?;
-    if cipher_text.len() < 16 {
-        return Err("ciphertext shorter than IV".to_string());
-    }
-
-    let iv: [u8; 16] = cipher_text[..16].try_into().unwrap();
-    let mut out = cipher_text.split_off(16);
-
-    match key.len() {
-        32 => {
-            let mut stream = Aes256Ctr::new_from_slices(key, &iv).map_err(|e| e.to_string())?;
-            stream.apply_keystream(&mut out);
-        }
-        16 => {
-            let mut stream = Aes128Ctr::new_from_slices(key, &iv).map_err(|e| e.to_string())?;
-            stream.apply_keystream(&mut out);
-        }
-        n => return Err(format!("unsupported AES key length: {}", n)),
-    }
-    Ok(out)
-}
-
-/// Random lowercase-alphanumeric string (correlation ID / secret key).
-fn random_string(len: usize) -> String {
-    let mut rng = rand::thread_rng();
-    (0..len)
-        .map(|_| {
-            let idx = rng.gen_range(0..36);
-            if idx < 10 {
-                (b'0' + idx) as char
-            } else {
-                (b'a' + idx - 10) as char
-            }
-        })
-        .collect()
-}
-
-/// z-base-32 encoded random nonce for correlation URLs.
-fn zbase32_nonce(len: usize) -> String {
-    let mut rng = rand::thread_rng();
-    (0..len)
-        .map(|_| ZBASE32_ALPHABET[rng.gen_range(0..32)] as char)
-        .collect()
 }
 
 #[cfg(test)]

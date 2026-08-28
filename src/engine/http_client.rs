@@ -1,4 +1,5 @@
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::redirect::Policy;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -13,11 +14,19 @@ pub struct HttpResponse {
     pub body: String,
     /// Individual header key-value pairs.
     pub headers_map: HashMap<String, String>,
+    /// Request round-trip time in seconds (exposed as the `duration` DSL var).
+    pub duration_secs: f64,
 }
 
 /// Configurable async HTTP client with connection pooling.
+///
+/// Mirrors nuclei's redirect semantics: requests do NOT follow redirects by
+/// default; only requests belonging to blocks with `redirects: true` use the
+/// redirect-following client. Failed requests are retried `retries` times.
 pub struct HttpClient {
     client: reqwest::Client,
+    client_redirect: reqwest::Client,
+    retries: u32,
 }
 
 impl HttpClient {
@@ -27,50 +36,72 @@ impl HttpClient {
         max_redirects: usize,
         proxy_url: Option<&str>,
         custom_headers: &[(String, String)],
+        retries: u32,
     ) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::limited(max_redirects))
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        let build = |policy: Policy| {
+            let mut builder = reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .danger_accept_invalid_certs(true)
+                .redirect(policy)
+                .pool_max_idle_per_host(20)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-        // Configure proxy if provided.
-        if let Some(proxy) = proxy_url {
-            if let Ok(p) = reqwest::Proxy::all(proxy) {
-                builder = builder.proxy(p);
-            }
-        }
-
-        // Add custom default headers.
-        if !custom_headers.is_empty() {
-            let mut headers = HeaderMap::new();
-            for (k, v) in custom_headers {
-                if let (Ok(name), Ok(val)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(v),
-                ) {
-                    headers.insert(name, val);
+            if let Some(proxy) = proxy_url {
+                if let Ok(p) = reqwest::Proxy::all(proxy) {
+                    builder = builder.proxy(p);
                 }
             }
-            builder = builder.default_headers(headers);
+
+            if !custom_headers.is_empty() {
+                let mut headers = HeaderMap::new();
+                for (k, v) in custom_headers {
+                    if let (Ok(name), Ok(val)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(v),
+                    ) {
+                        headers.insert(name, val);
+                    }
+                }
+                builder = builder.default_headers(headers);
+            }
+
+            builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        };
+
+        Self {
+            client: build(Policy::none()),
+            client_redirect: build(Policy::limited(max_redirects)),
+            retries,
         }
-
-        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-
-        Self { client }
     }
 
-    /// Create a simple client with just a timeout (for basic usage).
-    #[allow(dead_code)]
-    pub fn simple(timeout_secs: u64) -> Self {
-        Self::new(timeout_secs, 10, None, &[])
-    }
-
-    /// Send an HTTP request and return the parsed response.
+    /// Send an HTTP request without following redirects (nuclei default).
     pub async fn send(
         &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        body: &Option<String>,
+    ) -> Result<HttpResponse, reqwest::Error> {
+        self.execute(&self.client, method, url, headers, body).await
+    }
+
+    /// Send an HTTP request following redirects (blocks with `redirects: true`).
+    pub async fn send_following(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        body: &Option<String>,
+    ) -> Result<HttpResponse, reqwest::Error> {
+        self.execute(&self.client_redirect, method, url, headers, body)
+            .await
+    }
+
+    async fn execute(
+        &self,
+        client: &reqwest::Client,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -87,38 +118,28 @@ impl HttpClient {
             _ => reqwest::Method::GET,
         };
 
-        let mut request = self.client.request(method, url);
+        let mut last_err = None;
+        for _attempt in 0..=self.retries {
+            let mut request = client.request(method.clone(), url);
 
-        // Add per-request headers.
-        for (k, v) in headers {
-            request = request.header(k.as_str(), v.as_str());
+            for (k, v) in headers {
+                request = request.header(k.as_str(), v.as_str());
+            }
+            if let Some(body_content) = body {
+                request = request.body(body_content.clone());
+            }
+
+            let started = std::time::Instant::now();
+            match request.send().await {
+                Ok(response) => {
+                    let duration_secs = started.elapsed().as_secs_f64();
+                    return Ok(parse_response(response, duration_secs).await);
+                }
+                Err(e) => last_err = Some(e),
+            }
         }
 
-        // Add body if present.
-        if let Some(body_content) = body {
-            request = request.body(body_content.clone());
-        }
-
-        let response = request.send().await?;
-        let status = response.status().as_u16();
-
-        // Serialize headers to both raw string and map.
-        let mut headers_raw = String::new();
-        let mut headers_map = HashMap::new();
-        for (key, value) in response.headers() {
-            let v = value.to_str().unwrap_or_default();
-            headers_raw.push_str(&format!("{}: {}\n", key.as_str(), v));
-            headers_map.insert(key.as_str().to_lowercase(), v.to_string());
-        }
-
-        let body = response.text().await.unwrap_or_default();
-
-        Ok(HttpResponse {
-            status,
-            headers_raw,
-            body,
-            headers_map,
-        })
+        Err(last_err.expect("at least one request attempt"))
     }
 
     /// Parse a raw HTTP request string and send it.
@@ -127,11 +148,39 @@ impl HttpClient {
         &self,
         raw: &str,
         target_url: &str,
+        follow_redirects: bool,
     ) -> Result<HttpResponse, String> {
         let parsed = parse_raw_request(raw, target_url)?;
-        self.send(&parsed.method, &parsed.url, &parsed.headers, &parsed.body)
-            .await
-            .map_err(|e| e.to_string())
+        let result = if follow_redirects {
+            self.send_following(&parsed.method, &parsed.url, &parsed.headers, &parsed.body)
+                .await
+        } else {
+            self.send(&parsed.method, &parsed.url, &parsed.headers, &parsed.body)
+                .await
+        };
+        result.map_err(|e| e.to_string())
+    }
+}
+
+async fn parse_response(response: reqwest::Response, duration_secs: f64) -> HttpResponse {
+    let status = response.status().as_u16();
+
+    let mut headers_raw = String::new();
+    let mut headers_map = HashMap::new();
+    for (key, value) in response.headers() {
+        let v = value.to_str().unwrap_or_default();
+        headers_raw.push_str(&format!("{}: {}\n", key.as_str(), v));
+        headers_map.insert(key.as_str().to_lowercase(), v.to_string());
+    }
+
+    let body = response.text().await.unwrap_or_default();
+
+    HttpResponse {
+        status,
+        headers_raw,
+        body,
+        headers_map,
+        duration_secs,
     }
 }
 

@@ -9,7 +9,7 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 use nuclei_run::engine::interactsh::InteractshClient;
 use nuclei_run::engine::runner::{EngineRunner, ScanTask};
 use nuclei_run::parser::yaml_loader;
-use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +114,7 @@ async fn test_interactsh_end_to_end() {
         false,
         false,
         30,
+        1,
         Some(client),
     ));
 
@@ -262,7 +263,14 @@ fn build_poll_response(state: &MockState) -> Option<String> {
 
     let pem_b64 = state.client_pubkey.lock().unwrap().clone()?;
     let pem = String::from_utf8(general_purpose::STANDARD.decode(pem_b64).ok()?).ok()?;
-    let pubkey = RsaPublicKey::from_pkcs1_pem(&pem).ok()?;
+    // The PEM label is "RSA PUBLIC KEY" but carries PKIX (SPKI) DER.
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    let der = general_purpose::STANDARD.decode(body).ok()?;
+    let pubkey = RsaPublicKey::from_public_key_der(&der).ok()?;
 
     let interaction = serde_json::json!({
         "protocol": "http",

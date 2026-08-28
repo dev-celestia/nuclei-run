@@ -172,6 +172,7 @@ impl UiScannerAdapter for NucleiUiEngine {
             false,
             false,
             0,
+            1,
             None,
         ));
 
