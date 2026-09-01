@@ -12,6 +12,7 @@ use crate::models::result::ScanFinding;
 use crate::models::template::{CodeBlock, DnsBlock, HttpBlock, NetworkBlock, NucleiTemplate, SslBlock};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Match context accumulated while evaluating a flow expression.
@@ -106,15 +107,18 @@ impl EngineRunner {
                     None => false,
                 },
                 FlowNode::Dns(i) => match template.dns.get(*i) {
-                    Some(block) => self.flow_dns_block(block, target, ctx).await,
+                    Some(block) => self.flow_dns_block(block, target, extracted_vars, ctx).await,
                     None => false,
                 },
                 FlowNode::Network(i) => match template.network.get(*i) {
-                    Some(block) => self.flow_network_block(block, target, ctx).await,
+                    Some(block) => {
+                        self.flow_network_block(block, target, extracted_vars, ctx)
+                            .await
+                    }
                     None => false,
                 },
                 FlowNode::Ssl(i) => match template.ssl.get(*i) {
-                    Some(block) => self.flow_ssl_block(block, target, ctx).await,
+                    Some(block) => self.flow_ssl_block(block, target, extracted_vars, ctx).await,
                     None => false,
                 },
                 FlowNode::Code(i) => match template.code.get(*i) {
@@ -189,18 +193,14 @@ impl EngineRunner {
 
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            let follow_redirects = block.redirects.unwrap_or(false);
+            let policy = self.block_request_policy(block);
             let response: HttpResponse = match req_spec {
                 RequestSpec::Standard {
                     ref method,
                     ref url,
                     ref headers,
                     ref body,
-                } => match if follow_redirects {
-                    self.client.send_following(method, url, headers, body).await
-                } else {
-                    self.client.send(method, url, headers, body).await
-                } {
+                } => match self.client.send(method, url, headers, body, &policy).await {
                     Ok(r) => {
                         self.host_errors.record_success(target).await;
                         r
@@ -213,7 +213,7 @@ impl EngineRunner {
                     }
                 },
                 RequestSpec::Raw(ref raw_content) => {
-                    match self.client.send_raw(raw_content, target, follow_redirects).await {
+                    match self.client.send_raw(raw_content, target, &policy).await {
                         Ok(r) => {
                             self.host_errors.record_success(target).await;
                             r
@@ -287,13 +287,36 @@ impl EngineRunner {
     }
 
     /// Execute one dns block referenced by a flow and report whether it matched.
-    async fn flow_dns_block(&self, block: &DnsBlock, target: &str, ctx: &mut FlowMatchContext) -> bool {
+    async fn flow_dns_block(
+        &self,
+        block: &DnsBlock,
+        target: &str,
+        extracted_vars: &mut HashMap<String, String>,
+        ctx: &mut FlowMatchContext,
+    ) -> bool {
         self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let Ok(dns_resp) = DnsClient::execute(block, target).await else {
+        let started = Instant::now();
+        let Ok(dns_resp) =
+            DnsClient::execute(block, target, extracted_vars, self.timeout_secs).await
+        else {
             return false;
         };
+        let duration_secs = started.elapsed().as_secs_f64();
+
+        let mut vars = extracted_vars.clone();
+        vars.extend(dns_resp.variables());
+        let new_extractions =
+            ExtractorEngine::extract_from_parts(&block.extractors, &vars, "raw", duration_secs);
+        extracted_vars.extend(new_extractions);
+
         if block.matchers.is_empty() {
             ctx.matched_url = Some(dns_resp.host.clone());
+            ctx.extracted = ExtractorEngine::extract_output_from_parts(
+                &block.extractors,
+                &vars,
+                "raw",
+                duration_secs,
+            );
             ctx.protocol = "dns".to_string();
             return true;
         }
@@ -304,14 +327,20 @@ impl EngineRunner {
             interactsh_protocol: None,
             interactsh_request: None,
             interactsh_response: None,
-            duration_secs: 0.0,
-            named_parts: None,
+            duration_secs,
+            named_parts: Some(&vars),
         };
         let condition = block.matchers_condition.as_deref().unwrap_or("or");
-        let matched = MatcherEngine::evaluate_all(&block.matchers, condition, &eval_resp);
+        let matchers = interpolate_matchers(&block.matchers, target, extracted_vars);
+        let matched = MatcherEngine::evaluate_all(&matchers, condition, &eval_resp);
         if matched {
             ctx.matched_url = Some(dns_resp.host.clone());
-            ctx.extracted = dns_resp.records.clone();
+            ctx.extracted = ExtractorEngine::extract_output_from_parts(
+                &block.extractors,
+                &vars,
+                "raw",
+                duration_secs,
+            );
             ctx.protocol = "dns".to_string();
         }
         matched
@@ -322,62 +351,120 @@ impl EngineRunner {
         &self,
         block: &NetworkBlock,
         target: &str,
+        extracted_vars: &mut HashMap<String, String>,
         ctx: &mut FlowMatchContext,
     ) -> bool {
         self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let Ok(net_resp) = NetworkClient::execute(block, target, self.timeout_secs).await else {
+        let started = Instant::now();
+        let Ok(net_resp) =
+            NetworkClient::execute(block, target, extracted_vars, self.timeout_secs).await
+        else {
             return false;
         };
+        let duration_secs = started.elapsed().as_secs_f64();
+
+        let mut vars = extracted_vars.clone();
+        vars.extend(net_resp.variables());
+        let new_extractions =
+            ExtractorEngine::extract_from_parts(&block.extractors, &vars, "data", duration_secs);
+        extracted_vars.extend(new_extractions);
+
         if block.matchers.is_empty() {
-            ctx.matched_url = Some(net_resp.host.clone());
-            ctx.protocol = if block.tls { "tls".to_string() } else { "tcp".to_string() };
+            ctx.matched_url = Some(net_resp.address.clone());
+            ctx.extracted = ExtractorEngine::extract_output_from_parts(
+                &block.extractors,
+                &vars,
+                "data",
+                duration_secs,
+            );
+            ctx.protocol = "network".to_string();
             return true;
         }
         let eval_resp = EvaluatedResponse {
             status: 0,
             headers: "",
-            body: &net_resp.body,
+            body: &net_resp.data,
             interactsh_protocol: None,
             interactsh_request: None,
             interactsh_response: None,
-            duration_secs: 0.0,
-            named_parts: None,
+            duration_secs,
+            named_parts: Some(&vars),
         };
         let condition = block.matchers_condition.as_deref().unwrap_or("or");
-        let matched = MatcherEngine::evaluate_all(&block.matchers, condition, &eval_resp);
+        let matchers = interpolate_matchers(&block.matchers, target, extracted_vars);
+        let matched = MatcherEngine::evaluate_all(&matchers, condition, &eval_resp);
         if matched {
-            ctx.matched_url = Some(net_resp.host.clone());
-            ctx.protocol = if block.tls { "tls".to_string() } else { "tcp".to_string() };
+            ctx.matched_url = Some(net_resp.address.clone());
+            ctx.extracted = ExtractorEngine::extract_output_from_parts(
+                &block.extractors,
+                &vars,
+                "data",
+                duration_secs,
+            );
+            ctx.protocol = "network".to_string();
         }
         matched
     }
 
     /// Execute one ssl block referenced by a flow and report whether it matched.
-    async fn flow_ssl_block(&self, block: &SslBlock, target: &str, ctx: &mut FlowMatchContext) -> bool {
+    async fn flow_ssl_block(
+        &self,
+        block: &SslBlock,
+        target: &str,
+        extracted_vars: &mut HashMap<String, String>,
+        ctx: &mut FlowMatchContext,
+    ) -> bool {
         self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let Ok(ssl_resp) = SslClient::execute(block, target, self.timeout_secs).await else {
+        let started = Instant::now();
+        let Ok(ssl_resp) =
+            SslClient::execute(block, target, extracted_vars, self.timeout_secs).await
+        else {
             return false;
         };
+        let duration_secs = started.elapsed().as_secs_f64();
+
+        let mut vars = extracted_vars.clone();
+        vars.extend(ssl_resp.variables());
+        let new_extractions = ExtractorEngine::extract_from_parts(
+            &block.extractors,
+            &vars,
+            "response",
+            duration_secs,
+        );
+        extracted_vars.extend(new_extractions);
+
         if block.matchers.is_empty() {
-            ctx.matched_url = Some(ssl_resp.address.clone());
+            ctx.matched_url = Some(ssl_resp.matched.clone());
+            ctx.extracted = ExtractorEngine::extract_output_from_parts(
+                &block.extractors,
+                &vars,
+                "response",
+                duration_secs,
+            );
             ctx.protocol = "ssl".to_string();
             return true;
         }
         let eval_resp = EvaluatedResponse {
             status: 0,
-            headers: &ssl_resp.cipher_suite,
-            body: &ssl_resp.raw,
+            headers: "",
+            body: &ssl_resp.response,
             interactsh_protocol: None,
             interactsh_request: None,
             interactsh_response: None,
-            duration_secs: 0.0,
-            named_parts: None,
+            duration_secs,
+            named_parts: Some(&vars),
         };
         let condition = block.matchers_condition.as_deref().unwrap_or("or");
-        let matched = MatcherEngine::evaluate_all(&block.matchers, condition, &eval_resp);
+        let matchers = interpolate_matchers(&block.matchers, target, extracted_vars);
+        let matched = MatcherEngine::evaluate_all(&matchers, condition, &eval_resp);
         if matched {
-            ctx.matched_url = Some(ssl_resp.address.clone());
-            ctx.extracted = vec![ssl_resp.subject_cn.clone(), ssl_resp.fingerprint_sha256.clone()];
+            ctx.matched_url = Some(ssl_resp.matched.clone());
+            ctx.extracted = ExtractorEngine::extract_output_from_parts(
+                &block.extractors,
+                &vars,
+                "response",
+                duration_secs,
+            );
             ctx.protocol = "ssl".to_string();
         }
         matched

@@ -19,34 +19,12 @@ pub fn resolve_helper_functions(input: &str) -> String {
     let mut result = input.to_string();
 
     // 1. Hashes & Checksums
-    result = resolve_func(&result, "md5", |s| {
-        let mut hasher = Md5::new();
-        hasher.update(s.as_bytes());
-        format!("{:x}", hasher.finalize())
-    });
-    result = resolve_func(&result, "sha1", |s| {
-        let mut hasher = Sha1::new();
-        hasher.update(s.as_bytes());
-        format!("{:x}", hasher.finalize())
-    });
-    result = resolve_func(&result, "sha256", |s| {
-        let mut hasher = Sha256::new();
-        hasher.update(s.as_bytes());
-        format!("{:x}", hasher.finalize())
-    });
-    result = resolve_func(&result, "sha512", |s| {
-        let mut hasher = Sha512::new();
-        hasher.update(s.as_bytes());
-        format!("{:x}", hasher.finalize())
-    });
-    result = resolve_func(&result, "mmh3", |s| {
-        murmur3_hash_str(s)
-    });
-    result = resolve_func(&result, "crc32", |s| {
-        let mut hasher = Crc32Hasher::new();
-        hasher.update(s.as_bytes());
-        format!("{:x}", hasher.finalize())
-    });
+    result = resolve_func(&result, "md5", md5_hex);
+    result = resolve_func(&result, "sha1", sha1_hex);
+    result = resolve_func(&result, "sha256", sha256_hex);
+    result = resolve_func(&result, "sha512", sha512_hex);
+    result = resolve_func(&result, "mmh3", murmur3_hash_str);
+    result = resolve_func(&result, "crc32", crc32_hex);
 
     // 2. Encodings / Decodings
     result = resolve_func(&result, "base64", |s| {
@@ -64,12 +42,12 @@ pub fn resolve_helper_functions(input: &str) -> String {
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_else(|_| s.to_string())
     });
-    result = resolve_func(&result, "url_encode", |s| urlencoding_encode(s));
+    result = resolve_func(&result, "url_encode", urlencoding_encode);
     result = resolve_func(&result, "url_decode", |s| {
         urlencoding_decode(s).unwrap_or_else(|_| s.to_string())
     });
-    result = resolve_func(&result, "html_escape", |s| html_escape(s));
-    result = resolve_func(&result, "html_unescape", |s| html_unescape(s));
+    result = resolve_func(&result, "html_escape", html_escape);
+    result = resolve_func(&result, "html_unescape", html_unescape);
     result = resolve_func(&result, "gzip", |s| {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         let _ = encoder.write_all(s.as_bytes());
@@ -331,6 +309,36 @@ pub fn murmur3_hash_str(s: &str) -> String {
     let mut cursor = std::io::Cursor::new(s.as_bytes());
     let hash = murmur3::murmur3_32(&mut cursor, 0).unwrap_or(0);
     (hash as i32).to_string()
+}
+
+pub fn md5_hex(input: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn sha1_hex(input: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn sha512_hex(input: &str) -> String {
+    let mut hasher = Sha512::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn crc32_hex(input: &str) -> String {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Simple URL encoding.

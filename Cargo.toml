@@ -89,6 +89,13 @@ chromiumoxide = "0.9"
 thiserror = "2"
 zip = { version = "8.6.0", features = ["deflate"] }
 tempfile = "3.27.0"
+psl = "2.1.226"
+jaq-parse = "1.0.3"
+jaq-json = { version = "2.0.3", features = ["serde"] }
+jaq-std = "3.0.3"
+jaq-core = "3.1.1"
+html5ever = "0.39.0"
+markup5ever_rcdom = "0.39.0"
 
 [profile.release]
 opt-level = 3

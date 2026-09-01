@@ -32,6 +32,18 @@ pub struct ScanConfig {
     /// Maximum redirects to follow.
     pub max_redirects: usize,
 
+    /// Global `-fr`: follow redirects for all http templates.
+    pub follow_redirects: bool,
+
+    /// Global `-fhr`: follow only same-host redirects.
+    pub follow_host_redirects: bool,
+
+    /// Global `-dr`: disable redirect following entirely.
+    pub disable_redirects: bool,
+
+    /// `-esc`: allow loading/executing self-contained templates.
+    pub enable_self_contained: bool,
+
     /// HTTP/SOCKS5 proxy URL.
     pub proxy: Option<String>,
 

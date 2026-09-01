@@ -37,6 +37,14 @@ pub struct EngineRunner {
     pub request_counter: Arc<AtomicUsize>,
     pub is_cancelled: Arc<AtomicBool>,
     pub interactsh: Option<Arc<InteractshClient>>,
+    /// Global `-fr` / `--follow-redirects`.
+    pub follow_redirects: bool,
+    /// Global `-fhr` / `--follow-host-redirects`.
+    pub follow_host_redirects: bool,
+    /// Global `-dr` / `--disable-redirects` (overrides template settings).
+    pub disable_redirects: bool,
+    /// Global `-mr` / `--max-redirects` (overrides per-block caps when set).
+    pub global_max_redirects: usize,
 }
 
 impl EngineRunner {
@@ -57,14 +65,57 @@ impl EngineRunner {
             concurrency,
             timeout_secs,
             rate_limit_rps,
-            client: HttpClient::new(timeout_secs, max_redirects, proxy_url, custom_headers, retries),
+            client: HttpClient::new(timeout_secs, proxy_url, custom_headers, retries),
             enable_code_templates,
             headless_enabled,
             host_errors: HostErrorsCache::new(max_host_errors),
             request_counter: Arc::new(AtomicUsize::new(0)),
             is_cancelled: Arc::new(AtomicBool::new(false)),
             interactsh,
+            follow_redirects: false,
+            follow_host_redirects: false,
+            disable_redirects: false,
+            global_max_redirects: max_redirects,
         }
+    }
+
+    /// Set the global redirect flags (mirrors Go `-fr`/`-fhr`/`-dr`).
+    pub fn with_redirect_flags(
+        mut self,
+        follow_redirects: bool,
+        follow_host_redirects: bool,
+        disable_redirects: bool,
+    ) -> Self {
+        self.follow_redirects = follow_redirects;
+        self.follow_host_redirects = follow_host_redirects;
+        self.disable_redirects = disable_redirects;
+        self
+    }
+
+    /// Compute the per-request-block HTTP behavior for an http block,
+    /// mirroring Go's Compile() + clientpool override order
+    /// (http.go:382-390, clientpool.go:432-451): template `redirects` /
+    /// global `-fr` enable follow-all; `host-redirects` / `-fhr` narrow it to
+    /// same-host; `-dr` disables everything; the global max wins when a
+    /// global follow flag is active, otherwise the block cap (0 → default 10).
+    pub fn block_request_policy(&self, block: &HttpBlock) -> crate::engine::http_client::RequestPolicy {
+        use crate::engine::http_client::{RedirectFlow, RequestPolicy};
+
+        let mut flow = RedirectFlow::DontFollow;
+        if block.redirects.unwrap_or(false) || self.follow_redirects {
+            flow = RedirectFlow::FollowAll;
+        }
+        if block.host_redirects.unwrap_or(false) || self.follow_host_redirects {
+            flow = RedirectFlow::FollowSameHost;
+        }
+        let mut max_redirects = block.max_redirects.unwrap_or(0);
+        if (self.follow_redirects || self.follow_host_redirects) && self.global_max_redirects > 0 {
+            max_redirects = self.global_max_redirects;
+        }
+        if self.disable_redirects {
+            flow = RedirectFlow::DontFollow;
+        }
+        RequestPolicy::new(flow, max_redirects, block.disable_cookie.unwrap_or(false))
     }
 
     /// Get the total number of HTTP requests sent so far.
@@ -224,13 +275,16 @@ impl EngineRunner {
         }
 
         // 1. DNS Protocol Execution
-        self.execute_dns(template, target, result_tx).await;
+        self.execute_dns(template, target, &mut extracted_vars, result_tx)
+            .await;
 
         // 2. Network / TCP Protocol Execution
-        self.execute_network(template, target, result_tx).await;
+        self.execute_network(template, target, &mut extracted_vars, result_tx)
+            .await;
 
         // 3. SSL / TLS Protocol Execution
-        self.execute_ssl(template, target, result_tx).await;
+        self.execute_ssl(template, target, &mut extracted_vars, result_tx)
+            .await;
 
         // 4. WHOIS Protocol Execution
         self.execute_whois(template, target, result_tx).await;

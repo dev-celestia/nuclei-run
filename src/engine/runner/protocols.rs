@@ -8,7 +8,9 @@ use crate::engine::http_client::HttpResponse;
 use crate::engine::js_client::JavaScriptClient;
 use crate::engine::matcher::{EvaluatedResponse, MatcherEngine};
 use crate::engine::network_client::NetworkClient;
-use crate::engine::runner::helpers::{build_http_requests, has_unresolved_variables, interpolate_matchers, RequestSpec};
+use crate::engine::runner::helpers::{
+    build_http_requests, has_unresolved_variables, interpolate_matchers, RequestSpec,
+};
 use crate::engine::runner::EngineRunner;
 use crate::engine::ssl_client::SslClient;
 use crate::engine::websocket_client::WebSocketClient;
@@ -17,6 +19,7 @@ use crate::models::result::ScanFinding;
 use crate::models::template::NucleiTemplate;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 impl EngineRunner {
@@ -24,13 +27,38 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        extracted_vars: &mut HashMap<String, String>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for dns_block in &template.dns {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(dns_resp) = DnsClient::execute(dns_block, target).await {
+            let started = Instant::now();
+            if let Ok(dns_resp) =
+                DnsClient::execute(dns_block, target, extracted_vars, self.timeout_secs).await
+            {
+                let duration_secs = started.elapsed().as_secs_f64();
+
+                // Go-parity variable map: rcode/sections/record-type keys
+                // serve both `part:` lookups and DSL evaluation.
+                let mut vars = extracted_vars.clone();
+                vars.extend(dns_resp.variables());
+
+                let new_extractions = ExtractorEngine::extract_from_parts(
+                    &dns_block.extractors,
+                    &vars,
+                    "raw",
+                    duration_secs,
+                );
+                extracted_vars.extend(new_extractions);
+
+                if dns_block.matchers.is_empty() {
+                    continue;
+                }
+
                 let eval_resp = EvaluatedResponse {
                     status: 0,
                     headers: "",
@@ -38,18 +66,28 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
-                    named_parts: None,
+                    duration_secs,
+                    named_parts: Some(&vars),
                 };
                 let condition = dns_block.matchers_condition.as_deref().unwrap_or("or");
-                if MatcherEngine::evaluate_all(&dns_block.matchers, condition, &eval_resp) {
+                let matchers = interpolate_matchers(&dns_block.matchers, target, extracted_vars);
+                let has_non_internal_matchers = dns_block.matchers.iter().any(|m| !m.internal);
+                if has_non_internal_matchers
+                    && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp)
+                {
+                    let output_values = ExtractorEngine::extract_output_from_parts(
+                        &dns_block.extractors,
+                        &vars,
+                        "raw",
+                        duration_secs,
+                    );
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
                         severity: template.info.severity.to_lowercase(),
                         matched_url: dns_resp.host,
                         matched_at: chrono::Utc::now().to_rfc3339(),
-                        extracted_results: dns_resp.records,
+                        extracted_results: output_values,
                         protocol: "dns".to_string(),
                         matcher_name: None,
                         tags: template.info.tags.clone(),
@@ -64,33 +102,68 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        extracted_vars: &mut HashMap<String, String>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for net_block in &template.network {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(net_resp) = NetworkClient::execute(net_block, target, self.timeout_secs).await {
+            let started = Instant::now();
+            if let Ok(net_resp) =
+                NetworkClient::execute(net_block, target, extracted_vars, self.timeout_secs).await
+            {
+                let duration_secs = started.elapsed().as_secs_f64();
+
+                // Go-parity variable map: data (final read, default part),
+                // raw, request, ip, and named input buffers.
+                let mut vars = extracted_vars.clone();
+                vars.extend(net_resp.variables());
+
+                let new_extractions = ExtractorEngine::extract_from_parts(
+                    &net_block.extractors,
+                    &vars,
+                    "data",
+                    duration_secs,
+                );
+                extracted_vars.extend(new_extractions);
+
+                if net_block.matchers.is_empty() {
+                    continue;
+                }
+
                 let eval_resp = EvaluatedResponse {
                     status: 0,
                     headers: "",
-                    body: &net_resp.body,
+                    body: &net_resp.data,
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
-                    named_parts: None,
+                    duration_secs,
+                    named_parts: Some(&vars),
                 };
                 let condition = net_block.matchers_condition.as_deref().unwrap_or("or");
-                if MatcherEngine::evaluate_all(&net_block.matchers, condition, &eval_resp) {
+                let matchers = interpolate_matchers(&net_block.matchers, target, extracted_vars);
+                let has_non_internal_matchers = net_block.matchers.iter().any(|m| !m.internal);
+                if has_non_internal_matchers
+                    && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp)
+                {
+                    let output_values = ExtractorEngine::extract_output_from_parts(
+                        &net_block.extractors,
+                        &vars,
+                        "data",
+                        duration_secs,
+                    );
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
                         severity: template.info.severity.to_lowercase(),
-                        matched_url: net_resp.host,
+                        matched_url: net_resp.address,
                         matched_at: chrono::Utc::now().to_rfc3339(),
-                        extracted_results: vec![],
-                        protocol: if net_block.tls { "tls".to_string() } else { "tcp".to_string() },
+                        extracted_results: output_values,
+                        protocol: "network".to_string(),
                         matcher_name: None,
                         tags: template.info.tags.clone(),
                     };
@@ -104,32 +177,67 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        extracted_vars: &mut HashMap<String, String>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for ssl_block in &template.ssl {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(ssl_resp) = SslClient::execute(ssl_block, target, self.timeout_secs).await {
+            let started = Instant::now();
+            if let Ok(ssl_resp) =
+                SslClient::execute(ssl_block, target, extracted_vars, self.timeout_secs).await
+            {
+                let duration_secs = started.elapsed().as_secs_f64();
+
+                // Go-parity variable map: tlsx fields by json tag plus the
+                // full `response` JSON (the default match part).
+                let mut vars = extracted_vars.clone();
+                vars.extend(ssl_resp.variables());
+
+                let new_extractions = ExtractorEngine::extract_from_parts(
+                    &ssl_block.extractors,
+                    &vars,
+                    "response",
+                    duration_secs,
+                );
+                extracted_vars.extend(new_extractions);
+
+                if ssl_block.matchers.is_empty() {
+                    continue;
+                }
+
                 let eval_resp = EvaluatedResponse {
                     status: 0,
-                    headers: &ssl_resp.cipher_suite,
-                    body: &ssl_resp.raw,
+                    headers: "",
+                    body: &ssl_resp.response,
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
-                    named_parts: None,
+                    duration_secs,
+                    named_parts: Some(&vars),
                 };
                 let condition = ssl_block.matchers_condition.as_deref().unwrap_or("or");
-                if MatcherEngine::evaluate_all(&ssl_block.matchers, condition, &eval_resp) {
+                let matchers = interpolate_matchers(&ssl_block.matchers, target, extracted_vars);
+                let has_non_internal_matchers = ssl_block.matchers.iter().any(|m| !m.internal);
+                if has_non_internal_matchers
+                    && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp)
+                {
+                    let output_values = ExtractorEngine::extract_output_from_parts(
+                        &ssl_block.extractors,
+                        &vars,
+                        "response",
+                        duration_secs,
+                    );
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
                         severity: template.info.severity.to_lowercase(),
-                        matched_url: ssl_resp.address,
+                        matched_url: ssl_resp.matched,
                         matched_at: chrono::Utc::now().to_rfc3339(),
-                        extracted_results: vec![ssl_resp.subject_cn, ssl_resp.fingerprint_sha256],
+                        extracted_results: output_values,
                         protocol: "ssl".to_string(),
                         matcher_name: None,
                         tags: template.info.tags.clone(),
@@ -147,10 +255,15 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for whois_block in &template.whois {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(whois_resp) = WhoisClient::execute(whois_block, target, self.timeout_secs).await {
+            let started = Instant::now();
+            if let Ok(whois_resp) =
+                WhoisClient::execute(whois_block, target, self.timeout_secs).await
+            {
                 let eval_resp = EvaluatedResponse {
                     status: 0,
                     headers: "",
@@ -158,7 +271,7 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
+                    duration_secs: started.elapsed().as_secs_f64(),
                     named_parts: None,
                 };
                 let condition = whois_block.matchers_condition.as_deref().unwrap_or("or");
@@ -187,7 +300,10 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for file_block in &template.file {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let started = Instant::now();
             let file_responses = FileClient::scan_path(file_block, target);
             for f_resp in file_responses {
                 let eval_resp = EvaluatedResponse {
@@ -197,7 +313,7 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
+                    duration_secs: started.elapsed().as_secs_f64(),
                     named_parts: None,
                 };
                 let condition = file_block.matchers_condition.as_deref().unwrap_or("or");
@@ -226,10 +342,15 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for code_block in &template.code {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(code_resp) = CodeClient::execute(code_block, target, self.enable_code_templates).await {
+            let started = Instant::now();
+            if let Ok(code_resp) =
+                CodeClient::execute(code_block, target, self.enable_code_templates).await
+            {
                 let eval_resp = EvaluatedResponse {
                     status: code_resp.exit_code as u16,
                     headers: &code_resp.stderr,
@@ -237,7 +358,7 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
+                    duration_secs: started.elapsed().as_secs_f64(),
                     named_parts: None,
                 };
                 let condition = code_block.matchers_condition.as_deref().unwrap_or("or");
@@ -266,10 +387,14 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for ws_block in &template.websocket {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(ws_resp) = WebSocketClient::execute(ws_block, target, self.timeout_secs).await {
+            let started = Instant::now();
+            if let Ok(ws_resp) = WebSocketClient::execute(ws_block, target, self.timeout_secs).await
+            {
                 let eval_resp = EvaluatedResponse {
                     status: 0,
                     headers: "",
@@ -277,7 +402,7 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
+                    duration_secs: started.elapsed().as_secs_f64(),
                     named_parts: None,
                 };
                 let condition = ws_block.matchers_condition.as_deref().unwrap_or("or");
@@ -307,13 +432,18 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for headless_block in &template.headless {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             if !self.headless_enabled {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Ok(headless_resp) = HeadlessClient::execute(headless_block, target, extracted_vars).await {
+            let started = Instant::now();
+            if let Ok(headless_resp) =
+                HeadlessClient::execute(headless_block, target, extracted_vars).await
+            {
                 let eval_resp = EvaluatedResponse {
                     status: headless_resp.status,
                     headers: &headless_resp.headers,
@@ -321,7 +451,7 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
+                    duration_secs: started.elapsed().as_secs_f64(),
                     named_parts: Some(&headless_resp.data),
                 };
                 let condition = headless_block.matchers_condition.as_deref().unwrap_or("or");
@@ -351,9 +481,12 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for js_block in &template.javascript {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
 
+            let started = Instant::now();
             if let Ok(js_resp) = JavaScriptClient::execute(js_block, target).await {
                 if !js_resp.precondition_met {
                     continue;
@@ -367,7 +500,7 @@ impl EngineRunner {
                     interactsh_protocol: None,
                     interactsh_request: None,
                     interactsh_response: None,
-                    duration_secs: 0.0,
+                    duration_secs: started.elapsed().as_secs_f64(),
                     named_parts: None,
                 };
                 let condition = js_block.matchers_condition.as_deref().unwrap_or("or");
@@ -400,7 +533,9 @@ impl EngineRunner {
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for http_block in &template.http {
-            if self.is_cancelled.load(Ordering::Relaxed) { return; }
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
 
             // Determine request mode: raw or path-based.
             let mut requests_to_send = build_http_requests(http_block, target, extracted_vars);
@@ -436,7 +571,9 @@ impl EngineRunner {
                         *raw = substituted;
                         urls
                     }
-                    RequestSpec::Standard { url, headers, body, .. } => {
+                    RequestSpec::Standard {
+                        url, headers, body, ..
+                    } => {
                         let mut urls = Vec::new();
                         let (new_url, u) = self.substitute_interactsh(url).await;
                         urls.extend(u);
@@ -458,7 +595,9 @@ impl EngineRunner {
             }
 
             for (req_index, req_spec) in requests_to_send.into_iter().enumerate() {
-                if self.is_cancelled.load(Ordering::Relaxed) { return; }
+                if self.is_cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
 
                 let has_unresolved = match &req_spec {
                     RequestSpec::Standard { url, body, .. } => {
@@ -467,42 +606,50 @@ impl EngineRunner {
                     }
                     RequestSpec::Raw(raw_content) => has_unresolved_variables(raw_content),
                 };
-                if has_unresolved { continue; }
+                if has_unresolved {
+                    continue;
+                }
 
                 self.request_counter.fetch_add(1, Ordering::Relaxed);
 
-                let follow_redirects = http_block.redirects.unwrap_or(false);
+                let policy = self.block_request_policy(http_block);
                 let response: HttpResponse = match req_spec {
                     RequestSpec::Standard {
                         ref method,
                         ref url,
                         ref headers,
                         ref body,
-                    } => match if follow_redirects {
-                        self.client.send_following(method, url, headers, body).await
-                    } else {
-                        self.client.send(method, url, headers, body).await
-                    } {
+                    } => match self.client.send(method, url, headers, body, &policy).await {
                         Ok(r) => {
                             self.host_errors.record_success(target).await;
                             r
                         }
                         Err(_) => {
                             if self.host_errors.record_error(target).await {
-                                eprintln!("[WRN] Too many errors for host {} — dropping it", target);
+                                eprintln!(
+                                    "[WRN] Too many errors for host {} — dropping it",
+                                    target
+                                );
                             }
                             continue;
                         }
                     },
                     RequestSpec::Raw(ref raw_content) => {
-                        match self.client.send_raw(raw_content, target, follow_redirects).await {
+                        match self
+                            .client
+                            .send_raw(raw_content, target, &policy)
+                            .await
+                        {
                             Ok(r) => {
                                 self.host_errors.record_success(target).await;
                                 r
                             }
                             Err(_) => {
                                 if self.host_errors.record_error(target).await {
-                                    eprintln!("[WRN] Too many errors for host {} — dropping it", target);
+                                    eprintln!(
+                                        "[WRN] Too many errors for host {} — dropping it",
+                                        target
+                                    );
                                 }
                                 continue;
                             }
@@ -510,7 +657,8 @@ impl EngineRunner {
                     }
                 };
 
-                let new_extractions = ExtractorEngine::extract_all(&http_block.extractors, &response);
+                let new_extractions =
+                    ExtractorEngine::extract_all(&http_block.extractors, &response);
                 extracted_vars.extend(new_extractions);
 
                 // Register for OOB correlation when this request carried
@@ -543,7 +691,9 @@ impl EngineRunner {
                     interactsh_request: None,
                     interactsh_response: None,
                     duration_secs: response.duration_secs,
-                    named_parts: None,
+                    // Extracted values are visible to DSL matchers, as Go
+                    // merges them into the data map before operator execution.
+                    named_parts: Some(extracted_vars),
                 };
 
                 let condition = http_block.matchers_condition.as_deref().unwrap_or("or");
@@ -552,7 +702,10 @@ impl EngineRunner {
 
                 if is_match {
                     if has_non_internal_matchers {
-                        let output_values = ExtractorEngine::extract_output_values(&http_block.extractors, &response);
+                        let output_values = ExtractorEngine::extract_output_values(
+                            &http_block.extractors,
+                            &response,
+                        );
 
                         let matched_url = match &req_spec {
                             RequestSpec::Standard { url, .. } => url.clone(),

@@ -6,9 +6,12 @@ pub use matchers::{
     match_binary, match_dsl, match_regex, match_size, match_status, match_words, match_xpath,
 };
 #[allow(unused_imports)]
-pub use parts::{contains_bytes, get_part, hex_decode, parse_condition, EvaluatedResponse, MatchCondition};
+pub use parts::{
+    contains_bytes, get_part, hex_decode, parse_condition, EvaluatedResponse, MatchCondition,
+};
 
 use crate::models::template::TemplateMatcher;
+use std::borrow::Cow;
 
 /// High-performance matcher engine supporting word (Aho-Corasick), regex, status,
 /// binary, and DSL matcher types.
@@ -40,19 +43,42 @@ impl MatcherEngine {
             "word" => {
                 let content = get_part(matcher, resp);
                 let condition = parse_condition(matcher);
-                if matcher.case_insensitive {
-                    let lower_content = content.to_lowercase();
-                    let lower_words: Vec<String> =
-                        matcher.words.iter().map(|w| w.to_lowercase()).collect();
-                    match_words(&lower_words, &lower_content, condition)
+                let hex_encoded = matcher.encoding.as_deref() == Some("hex");
+                // Go's CompileMatchers hex-decodes words first, then applies
+                // CaseInsensitive to the decoded words.
+                let words: Vec<Vec<u8>> = matcher
+                    .words
+                    .iter()
+                    .map(|word| {
+                        let mut bytes = if hex_encoded {
+                            hex_decode(word)
+                                .filter(|decoded| !decoded.is_empty())
+                                .unwrap_or_else(|| word.as_bytes().to_vec())
+                        } else {
+                            word.as_bytes().to_vec()
+                        };
+                        if matcher.case_insensitive {
+                            bytes = lowercase_bytes(&bytes);
+                        }
+                        bytes
+                    })
+                    .collect();
+                let content_bytes: Cow<[u8]> = if matcher.case_insensitive {
+                    Cow::Owned(content.to_lowercase().into_bytes())
                 } else {
-                    match_words(&matcher.words, &content, condition)
-                }
+                    Cow::Borrowed(content.as_bytes())
+                };
+                match_words(&words, &content_bytes, condition)
             }
             "regex" => {
                 let content = get_part(matcher, resp);
                 let condition = parse_condition(matcher);
-                match_regex(&matcher.regex, &content, condition, matcher.case_insensitive)
+                match_regex(
+                    &matcher.regex,
+                    &content,
+                    condition,
+                    matcher.case_insensitive,
+                )
             }
             "binary" => {
                 let content = get_part(matcher, resp);
@@ -62,7 +88,8 @@ impl MatcherEngine {
             "size" => match_size(&matcher.size, resp.body.len()),
             "xpath" => {
                 let content = get_part(matcher, resp);
-                match_xpath(&matcher.xpath, &content)
+                let condition = parse_condition(matcher);
+                match_xpath(&matcher.xpath, &content, condition)
             }
             _ => false,
         };
@@ -92,9 +119,19 @@ impl MatcherEngine {
     }
 }
 
+/// Lowercase matcher word bytes like Go's `strings.ToLower` (Unicode-aware
+/// for valid UTF-8), falling back to ASCII lowercasing for arbitrary bytes.
+fn lowercase_bytes(bytes: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_lowercase().into_bytes(),
+        Err(_) => bytes.iter().map(|b| b.to_ascii_lowercase()).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn make_matcher(matcher_type: &str) -> TemplateMatcher {
         TemplateMatcher {
@@ -342,5 +379,122 @@ internal: true
             duration_secs: 0.0,
         };
         assert!(!MatcherEngine::evaluate(&m, &resp_no_match));
+    }
+
+    #[test]
+    fn test_hex_encoded_word_matcher() {
+        // Go nuclei TestHexEncoding: "50494e47" decodes to "PING".
+        let mut m = make_matcher("word");
+        m.words = vec!["50494e47".to_string()];
+        m.encoding = Some("hex".to_string());
+
+        let resp = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "received PING from server",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
+            duration_secs: 0.0,
+        };
+        assert!(MatcherEngine::evaluate(&m, &resp));
+
+        // The literal hex string must not match once encoding is declared.
+        let resp_literal = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "the text 50494e47 appears literally",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
+            duration_secs: 0.0,
+        };
+        assert!(!MatcherEngine::evaluate(&m, &resp_literal));
+    }
+
+    #[test]
+    fn test_hex_encoded_word_case_insensitive() {
+        let mut m = make_matcher("word");
+        m.words = vec!["50494E47".to_string()]; // "PING", uppercase hex
+        m.encoding = Some("hex".to_string());
+        m.case_insensitive = true;
+
+        let resp = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "got ping back",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
+            duration_secs: 0.0,
+        };
+        assert!(MatcherEngine::evaluate(&m, &resp));
+    }
+
+    #[test]
+    fn test_invalid_hex_word_kept_literally() {
+        // Go's CompileMatchers keeps words that fail hex decoding unchanged.
+        let mut m = make_matcher("word");
+        m.words = vec!["zz".to_string()];
+        m.encoding = Some("hex".to_string());
+
+        let resp = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "the zz marker",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
+            duration_secs: 0.0,
+        };
+        assert!(MatcherEngine::evaluate(&m, &resp));
+    }
+
+    #[test]
+    fn test_match_words_raw_bytes() {
+        // Decoded patterns need not be valid UTF-8.
+        let patterns = vec![vec![0xde, 0xad, 0xbe, 0xef]];
+        let text: Vec<u8> = vec![0x00, 0xde, 0xad, 0xbe, 0xef, 0x11];
+        assert!(match_words(&patterns, &text, MatchCondition::Or));
+
+        let text_missing: Vec<u8> = vec![0xde, 0xad, 0x00, 0xbe, 0xef];
+        assert!(!match_words(&patterns, &text_missing, MatchCondition::Or));
+    }
+
+    #[test]
+    fn test_dsl_matcher_with_extracted_variables() {
+        let mut m = make_matcher("dsl");
+        m.dsl = vec!["contains(token, \"SECRET\")".to_string()];
+
+        let mut named = HashMap::new();
+        named.insert("token".to_string(), "SECRET_value".to_string());
+
+        let resp = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "the token never appears in the body",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: Some(&named),
+            duration_secs: 0.0,
+        };
+        assert!(MatcherEngine::evaluate(&m, &resp));
+
+        let resp_without = EvaluatedResponse {
+            status: 200,
+            headers: "",
+            body: "the token never appears in the body",
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            named_parts: None,
+            duration_secs: 0.0,
+        };
+        assert!(!MatcherEngine::evaluate(&m, &resp_without));
     }
 }

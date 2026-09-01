@@ -1,7 +1,12 @@
 use nuclei_run::engine::headless_client::{locate_chrome, parse_duration, HeadlessClient};
+use nuclei_run::engine::runner::{EngineRunner, ScanTask};
 use nuclei_run::models::template::NucleiTemplate;
+use nuclei_run::parser::yaml_loader;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 #[test]
 fn test_headless_template_parsing_all_actions() {
@@ -61,7 +66,11 @@ headless:
 "#;
 
     let tmpl: Result<NucleiTemplate, _> = serde_yaml::from_str(yaml);
-    assert!(tmpl.is_ok(), "Failed to parse headless YAML: {:?}", tmpl.err());
+    assert!(
+        tmpl.is_ok(),
+        "Failed to parse headless YAML: {:?}",
+        tmpl.err()
+    );
     let tmpl = tmpl.unwrap();
     assert_eq!(tmpl.id, "test-headless-full-actions");
     assert_eq!(tmpl.headless.len(), 1);
@@ -70,7 +79,10 @@ headless:
     assert_eq!(steps.len(), 14);
 
     assert_eq!(steps[0].action, "navigate");
-    assert_eq!(steps[0].args.get("url"), Some(&"{{BaseURL}}/login".to_string()));
+    assert_eq!(
+        steps[0].args.get("url"),
+        Some(&"{{BaseURL}}/login".to_string())
+    );
 
     assert_eq!(steps[1].action, "waitload");
 
@@ -154,7 +166,11 @@ headless:
     let vars = HashMap::new();
     let result = HeadlessClient::execute(&tmpl.headless[0], "https://example.com", &vars).await;
 
-    assert!(result.is_ok(), "Live headless execution failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Live headless execution failed: {:?}",
+        result.err()
+    );
     let resp = result.unwrap();
     assert_eq!(resp.data.get("math_eval").map(|s| s.as_str()), Some("4"));
     assert!(resp.data.get("user_agent").is_some());
@@ -190,9 +206,135 @@ headless:
     let vars = HashMap::new();
     let result = HeadlessClient::execute(&tmpl.headless[0], "https://example.com", &vars).await;
 
-    assert!(result.is_ok(), "Live navigation metadata test failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Live navigation metadata test failed: {:?}",
+        result.err()
+    );
     let resp = result.unwrap();
     assert_eq!(resp.status, 200);
     assert!(!resp.headers.is_empty());
     assert!(resp.dom_content.contains("Example Domain") || resp.dom_content.contains("example"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_headless_form_flow_via_engine() {
+    if locate_chrome().is_none() {
+        eprintln!("[SKIP] Chrome/Chromium executable not found, skipping headless form flow test");
+        return;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let html = r#"<!DOCTYPE html>
+<html>
+<head><title>Test Page</title></head>
+<body>
+  <input id="username" type="text" />
+  <button id="submit" onclick="document.getElementById('result').innerText = document.getElementById('username').value + '-OK'">Submit</button>
+  <div id="result"></div>
+  <span id="csrf">CSRFTOKEN</span>
+</body>
+</html>"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+
+    let yaml = r#"
+id: test-headless-form-flow
+info:
+  name: Headless Form Flow Test
+  author: test
+  severity: high
+
+headless:
+  - steps:
+      - action: navigate
+        args:
+          url: "{{BaseURL}}/"
+      - action: waitload
+      - action: text
+        target: "input#username"
+        value: "admin"
+      - action: click
+        target: "button#submit"
+      - action: script
+        name: result
+        code: "document.getElementById('result').innerText"
+      - action: extract
+        name: csrf
+        selector: "span#csrf"
+        attribute: "innerText"
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: result
+        words:
+          - "admin-OK"
+      - type: word
+        part: csrf
+        words:
+          - "CSRFTOKEN"
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let template_path = dir.path().join("headless_template.yaml");
+    std::fs::write(&template_path, yaml).unwrap();
+
+    let loaded = yaml_loader::load_templates(
+        &template_path.to_string_lossy(),
+        &yaml_loader::TemplateFilter::default(),
+    );
+    assert_eq!(loaded.templates.len(), 1);
+    let template = Arc::new(loaded.templates.into_iter().next().unwrap());
+
+    let engine = Arc::new(EngineRunner::new(
+        1,
+        10,
+        0,
+        0,
+        None,
+        &[],
+        false,
+        true,
+        30,
+        0,
+        None,
+    ));
+
+    let tasks = vec![ScanTask { target, template }];
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let collector = tokio::spawn(async move {
+        let mut findings = Vec::new();
+        while let Some(f) = rx.recv().await {
+            findings.push(f);
+        }
+        findings
+    });
+
+    engine.run(tasks, tx).await;
+    let findings = collector.await.unwrap();
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].template_id, "test-headless-form-flow");
+    assert_eq!(findings[0].protocol, "headless");
 }

@@ -60,8 +60,24 @@ struct Cli {
     retries: u32,
 
     /// Maximum redirects to follow
-    #[arg(long = "max-redirects", default_value = "10")]
+    #[arg(long = "max-redirects", alias = "mr", default_value = "10")]
     max_redirects: usize,
+
+    /// Enable following redirects for http templates
+    #[arg(long = "follow-redirects", alias = "fr")]
+    follow_redirects: bool,
+
+    /// Follow redirects on the same host only
+    #[arg(long = "follow-host-redirects", alias = "fhr")]
+    follow_host_redirects: bool,
+
+    /// Disable redirects for http templates (overrides template settings)
+    #[arg(long = "disable-redirects", alias = "dr")]
+    disable_redirects: bool,
+
+    /// Enable loading self-contained templates
+    #[arg(long = "enable-self-contained", alias = "esc")]
+    enable_self_contained: bool,
 
     /// HTTP/SOCKS5 proxy URL
     #[arg(long = "proxy")]
@@ -319,6 +335,7 @@ async fn main() {
         tags: scan_config.tag_filter.clone(),
         ids: scan_config.id_filter.clone(),
         signature_policy,
+        enable_self_contained: scan_config.enable_self_contained,
     };
 
     // Resolve template paths (download remote URLs if needed).
@@ -342,6 +359,7 @@ async fn main() {
     let mut total_unsupported = 0;
     let mut total_errors = 0;
     let mut total_filtered = 0;
+    let mut total_self_contained_excluded = 0;
 
     for path in &resolved_paths {
         let result = yaml_loader::load_templates(&path.to_string_lossy(), &filter);
@@ -349,7 +367,15 @@ async fn main() {
         total_unsupported += result.skipped_unsupported;
         total_errors += result.skipped_parse_errors;
         total_filtered += result.skipped_filtered;
+        total_self_contained_excluded += result.skipped_self_contained;
         all_templates.extend(result.templates);
+    }
+
+    if total_self_contained_excluded > 0 && !scan_config.silent {
+        eprintln!(
+            "[INF] Excluded {} self-contained template[s] (disabled as default), use -esc option to run self-contained templates.",
+            total_self_contained_excluded
+        );
     }
 
     if all_templates.is_empty() {
@@ -408,29 +434,45 @@ async fn main() {
     };
 
     let mut tasks = Vec::new();
-    for target in &targets {
-        for template in &templates_arc {
+    for template in &templates_arc {
+        if yaml_loader::requires_self_contained(template) {
+            // Self-contained templates are not bound to targets: they run once
+            // with their own hardcoded URLs (Go: executeAllSelfContained).
             tasks.push(ScanTask {
-                target: target.clone(),
+                target: String::new(),
                 template: Arc::clone(template),
             });
+        } else {
+            for target in &targets {
+                tasks.push(ScanTask {
+                    target: target.clone(),
+                    template: Arc::clone(template),
+                });
+            }
         }
     }
 
     // Create engine runner.
-    let engine = Arc::new(EngineRunner::new(
-        scan_config.concurrency,
-        scan_config.timeout_secs,
-        scan_config.rate_limit_rps,
-        scan_config.max_redirects,
-        scan_config.proxy.as_deref(),
-        &scan_config.custom_headers,
-        scan_config.enable_code_templates,
-        scan_config.headless,
-        scan_config.max_host_errors,
-        scan_config.retries,
-        interactsh_client,
-    ));
+    let engine = Arc::new(
+        EngineRunner::new(
+            scan_config.concurrency,
+            scan_config.timeout_secs,
+            scan_config.rate_limit_rps,
+            scan_config.max_redirects,
+            scan_config.proxy.as_deref(),
+            &scan_config.custom_headers,
+            scan_config.enable_code_templates,
+            scan_config.headless,
+            scan_config.max_host_errors,
+            scan_config.retries,
+            interactsh_client,
+        )
+        .with_redirect_flags(
+            scan_config.follow_redirects,
+            scan_config.follow_host_redirects,
+            scan_config.disable_redirects,
+        ),
+    );
 
     // Set up finding channel.
     let (finding_tx, mut finding_rx) = tokio::sync::mpsc::channel(1000);
@@ -651,6 +693,10 @@ fn build_config(cli: &Cli) -> ScanConfig {
         timeout_secs: cli.timeout,
         retries: cli.retries,
         max_redirects: cli.max_redirects,
+        follow_redirects: cli.follow_redirects,
+        follow_host_redirects: cli.follow_host_redirects,
+        disable_redirects: cli.disable_redirects,
+        enable_self_contained: cli.enable_self_contained,
         proxy: cli.proxy.clone(),
         custom_headers,
         output_path: cli.output.clone(),

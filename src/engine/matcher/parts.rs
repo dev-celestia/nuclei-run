@@ -35,7 +35,12 @@ pub fn get_part<'a>(matcher: &TemplateMatcher, resp: &'a EvaluatedResponse) -> C
     match matcher.part.as_deref().unwrap_or("body") {
         "header" | "all_headers" => Cow::Borrowed(resp.headers),
         "response" => {
-            // "response" means the full HTTP response (headers + body).
+            // "response" means the full HTTP response (headers + body). For
+            // header-less protocols (ssl/dns/network) the body already is the
+            // response payload, so no concatenation happens.
+            if resp.headers.is_empty() {
+                return Cow::Borrowed(resp.body);
+            }
             let mut full = String::with_capacity(resp.headers.len() + resp.body.len() + 1);
             full.push_str(resp.headers);
             full.push('\n');
@@ -98,4 +103,103 @@ pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         return true;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Effective content length, mirroring Go nuclei's `utils.CalculateContentLength`:
+/// the Content-Length header value wins when present, otherwise the body size.
+pub fn calculate_content_length(headers: &str, body: &str) -> usize {
+    for line in headers.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                if let Ok(len) = value.trim().parse::<usize>() {
+                    return len;
+                }
+            }
+        }
+    }
+    body.len()
+}
+
+/// Build the per-response DSL variable map from raw headers, mirroring Go
+/// nuclei's `responseToDSLMap`: every header becomes a variable named
+/// lowercased with `-` replaced by `_` (multiple values joined by a space),
+/// and every Set-Cookie cookie name (lowercased) maps to its value.
+pub fn response_variables(headers: &str) -> HashMap<String, String> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+
+        // Cookies are inserted first, as in Go (header keys win on collision).
+        let key = name.trim().to_lowercase().replace('-', "_");
+        if key == "set_cookie" {
+            if let Some(pair) = value.split(';').next() {
+                if let Some((cookie_name, cookie_value)) = pair.split_once('=') {
+                    let cookie_name = cookie_name.trim().to_lowercase();
+                    if !cookie_name.is_empty() {
+                        vars.entry(cookie_name)
+                            .or_insert_with(|| cookie_value.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        let value = value.to_string();
+        vars.entry(key)
+            .and_modify(|existing| {
+                existing.push(' ');
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    vars
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_content_length_header_wins() {
+        assert_eq!(
+            calculate_content_length("Content-Length: 1000\n", "small"),
+            1000
+        );
+        assert_eq!(
+            calculate_content_length("Server: x\ncontent-length: 7\n", "small"),
+            7
+        );
+    }
+
+    #[test]
+    fn test_calculate_content_length_fallback() {
+        assert_eq!(calculate_content_length("Server: x\n", "small"), 5);
+        // Unparseable header falls back to the body size, like Go's -1.
+        assert_eq!(calculate_content_length("Content-Length: abc\n", "small"), 5);
+        assert_eq!(calculate_content_length("", ""), 0);
+    }
+
+    #[test]
+    fn test_response_variables_headers() {
+        let vars = response_variables("X-Powered-By: PHP/8.1\nContent-Type: application/json\n");
+        assert_eq!(vars.get("x_powered_by").map(String::as_str), Some("PHP/8.1"));
+        assert_eq!(
+            vars.get("content_type").map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_response_variables_multi_value_and_cookies() {
+        let vars = response_variables(
+            "Set-Cookie: session=abc123; Path=/\nSet-Cookie: csrf=t0k; HttpOnly\nServer: a\nServer: b\n",
+        );
+        assert_eq!(vars.get("session").map(String::as_str), Some("abc123"));
+        assert_eq!(vars.get("csrf").map(String::as_str), Some("t0k"));
+        // The raw header variable also exists, multi-values joined by space.
+        assert_eq!(vars.get("server").map(String::as_str), Some("a b"));
+        assert!(vars.get("set_cookie").is_some());
+    }
 }

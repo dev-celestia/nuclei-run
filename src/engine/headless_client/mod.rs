@@ -61,14 +61,11 @@ impl HeadlessClient {
             .build()
             .map_err(|e| e.to_string())?;
 
-        let (mut browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| e.to_string())?;
+        let (mut browser, mut handler) =
+            Browser::launch(config).await.map_err(|e| e.to_string())?;
 
         // Drive the browser event handler.
-        tokio::spawn(async move {
-            while handler.next().await.is_some() {}
-        });
+        tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         let page: Page = browser
             .new_page("about:blank")
@@ -111,7 +108,16 @@ impl HeadlessClient {
         let mut extra_headers: HashMap<String, String> = HashMap::new();
 
         for step in &block.steps {
-            execute_step(&page, step, target, &mut current_url, &mut named, &mut extra_headers, extracted_vars).await?;
+            execute_step(
+                &page,
+                step,
+                target,
+                &mut current_url,
+                &mut named,
+                &mut extra_headers,
+                extracted_vars,
+            )
+            .await?;
         }
 
         let dom_content = page.content().await.map_err(|e| e.to_string())?;
@@ -140,7 +146,16 @@ impl HeadlessClient {
         extra_headers: &mut HashMap<String, String>,
         extracted_vars: &HashMap<String, String>,
     ) -> Result<(), String> {
-        execute_step(page, step, target, current_url, named, extra_headers, extracted_vars).await
+        execute_step(
+            page,
+            step,
+            target,
+            current_url,
+            named,
+            extra_headers,
+            extracted_vars,
+        )
+        .await
     }
 }
 
@@ -166,6 +181,58 @@ mod tests {
         assert_eq!(parse_duration("3"), Duration::from_secs(3));
         assert_eq!(parse_duration("250"), Duration::from_millis(250));
         assert_eq!(parse_duration(""), Duration::from_secs(1));
+        // Edge cases
+        assert_eq!(parse_duration("1.5"), Duration::from_millis(1500));
+        assert_eq!(parse_duration("49"), Duration::from_secs(49));
+        assert_eq!(parse_duration("50"), Duration::from_millis(50));
+        assert_eq!(parse_duration("0"), Duration::from_millis(0));
+        assert_eq!(parse_duration("garbage"), Duration::from_secs(1));
+        assert_eq!(parse_duration("  2s  "), Duration::from_secs(2));
+        assert_eq!(parse_duration("1000ms"), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_js_value_to_string_containers() {
+        assert_eq!(
+            js_value_to_string(&serde_json::json!(["a", "b"])),
+            r#"["a","b"]"#
+        );
+        assert_eq!(
+            js_value_to_string(&serde_json::json!({"k": 1})),
+            r#"{"k":1}"#
+        );
+        assert_eq!(js_value_to_string(&serde_json::json!(3.14)), "3.14");
+    }
+
+    #[test]
+    fn test_get_step_target_alias_precedence() {
+        let mut step = HeadlessStep {
+            action: "text".to_string(),
+            name: None,
+            target: None,
+            code: None,
+            key: Some("key-fallback".to_string()),
+            value: None,
+            headers: HashMap::new(),
+            attribute: None,
+            args: HashMap::new(),
+        };
+
+        // Fallback: key
+        assert_eq!(get_step_target(&step), Some("key-fallback"));
+
+        // args.selector wins over key
+        step.args
+            .insert("selector".to_string(), "#selector".to_string());
+        assert_eq!(get_step_target(&step), Some("#selector"));
+
+        // args.by wins over args.selector
+        step.args.insert("by".to_string(), "#by".to_string());
+        assert_eq!(get_step_target(&step), Some("#by"));
+
+        // target wins over all
+        step.target = Some("#direct-target".to_string());
+        assert_eq!(get_step_target(&step), Some("#direct-target"));
     }
 
     #[test]
@@ -182,7 +249,8 @@ mod tests {
             args: HashMap::new(),
         };
 
-        step.args.insert("by".to_string(), "#user-input".to_string());
+        step.args
+            .insert("by".to_string(), "#user-input".to_string());
         step.args.insert("value".to_string(), "admin".to_string());
         assert_eq!(get_step_target(&step), Some("#user-input"));
         assert_eq!(get_step_value(&step), Some("admin"));

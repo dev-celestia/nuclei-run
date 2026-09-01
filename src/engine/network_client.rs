@@ -1,5 +1,8 @@
+use crate::engine::dsl::TemplateDsl;
+use crate::engine::variables::VariableResolver;
 use crate::models::template::{NetworkBlock, NetworkInput};
 use rustls::pki_types::ServerName;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7,41 +10,93 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 /// Network protocol execution response.
+///
+/// Field semantics mirror Go nuclei's `responseToDSLMap`
+/// (`pkg/protocols/network/operators.go`): `data` is the final read chunk
+/// (the default match part), `raw` is the full accumulated transaction.
 #[derive(Debug, Clone)]
 pub struct NetworkResponse {
+    /// Original target input (Go `host` variable).
     pub host: String,
-    #[allow(dead_code)]
+    /// Actual dialed host:port (Go `matched`).
+    pub address: String,
+    /// Everything written to the connection (Go `request` variable).
+    pub request: String,
+    /// Final read after all input steps (Go `data`, default match part).
+    pub data: String,
+    /// All read data combined (Go `raw`).
     pub raw: String,
-    pub body: String,
-    #[allow(dead_code)]
-    pub duration_ms: u64,
+    /// Named input buffers in read order (`name:` on inputs).
+    pub named: Vec<(String, String)>,
+    /// Dialed peer IP (Go `ip` variable).
+    pub ip: String,
+}
+
+impl NetworkResponse {
+    /// Go-parity variable map for matchers/extractors.
+    pub fn variables(&self) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        vars.insert("data".to_string(), self.data.clone());
+        vars.insert("raw".to_string(), self.raw.clone());
+        vars.insert("request".to_string(), self.request.clone());
+        vars.insert("host".to_string(), self.host.clone());
+        vars.insert("matched".to_string(), self.address.clone());
+        if !self.ip.is_empty() {
+            vars.insert("ip".to_string(), self.ip.clone());
+        }
+        for (name, value) in &self.named {
+            vars.insert(name.clone(), value.clone());
+        }
+        vars
+    }
 }
 
 pub struct NetworkClient;
 
 impl NetworkClient {
-    /// Execute a network block against a target.
+    /// Execute a network block against a target. `extra_vars` carries
+    /// template-level and previously extracted values used to interpolate
+    /// addresses and input data (Go renders both through the variable scope).
     pub async fn execute(
         block: &NetworkBlock,
         target: &str,
+        extra_vars: &HashMap<String, String>,
         timeout_secs: u64,
     ) -> Result<NetworkResponse, String> {
-        let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs.max(1));
 
-        // Determine destination host & port
-        let (host, port) = if !block.host.is_empty() {
-            parse_host_port(&block.host[0], block.port.as_deref())
+        // Determine destination host & port. Block hosts are interpolated
+        // first (Go: replacer.Replace(address, variables)); {{Hostname}} and
+        // friends resolve against the target.
+        let host_source = if !block.host.is_empty() {
+            interpolate(&block.host[0], target, extra_vars)
         } else {
-            parse_host_port(target, block.port.as_deref())
+            target.to_string()
         };
+        let (host, port) = parse_host_port(&host_source, block.port.as_deref());
 
         let addr = format!("{}:{}", host, port);
 
-        let mut received_bytes = Vec::new();
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| format!("Connection timeout to {}", addr))?
+            .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
+        let ip = stream
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_default();
+
+        let mut sent_bytes: Vec<u8> = Vec::new();
+        let mut all_reads: Vec<u8> = Vec::new();
+        let mut named: Vec<(String, String)> = Vec::new();
+        let mut step_vars: HashMap<String, String> = extra_vars.clone();
+
+        // Go always performs a final read after the input steps
+        // (`bufferSize` = read-size or 1024); its content is the `data` part.
+        let final_size = block.read_size.unwrap_or(1024).max(1);
+        let final_chunk;
 
         if block.tls {
-            // TLS over TCP
             let root_cert_store = rustls::RootCertStore::empty();
             let config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_cert_store)
@@ -52,81 +107,102 @@ impl NetworkClient {
                 .unwrap_or_else(|_| ServerName::try_from("localhost").unwrap())
                 .to_owned();
 
-            let stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
-                .await
-                .map_err(|_| format!("Connection timeout to {}", addr))?
-                .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
+            let mut tls_stream =
+                tokio::time::timeout(timeout, connector.connect(server_name, stream))
+                    .await
+                    .map_err(|_| format!("TLS handshake timeout to {}", addr))?
+                    .map_err(|e| format!("TLS handshake error with {}: {}", addr, e))?;
 
-            let mut tls_stream = tokio::time::timeout(timeout, connector.connect(server_name, stream))
-                .await
-                .map_err(|_| format!("TLS handshake timeout to {}", addr))?
-                .map_err(|e| format!("TLS handshake error with {}: {}", addr, e))?;
+            Self::run_conversation(
+                &mut tls_stream,
+                &block.inputs,
+                &mut sent_bytes,
+                &mut all_reads,
+                &mut named,
+                &mut step_vars,
+                target,
+                timeout,
+            )
+            .await?;
 
-            // Execute input steps
-            Self::interleave_io(&mut tls_stream, &block.inputs, block.read_size, &mut received_bytes, timeout).await?;
+            final_chunk = Self::read_chunk(&mut tls_stream, final_size, timeout).await;
         } else {
-            // Raw TCP Stream
-            let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
-                .await
-                .map_err(|_| format!("Connection timeout to {}", addr))?
-                .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
+            let mut stream = stream;
+            Self::run_conversation(
+                &mut stream,
+                &block.inputs,
+                &mut sent_bytes,
+                &mut all_reads,
+                &mut named,
+                &mut step_vars,
+                target,
+                timeout,
+            )
+            .await?;
 
-            Self::interleave_io(&mut stream, &block.inputs, block.read_size, &mut received_bytes, timeout).await?;
+            final_chunk = Self::read_chunk(&mut stream, final_size, timeout).await;
         }
 
-        let body = String::from_utf8_lossy(&received_bytes).to_string();
-        let raw = body.clone();
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let data = String::from_utf8_lossy(&final_chunk).to_string();
+        all_reads.extend_from_slice(&final_chunk);
+        let raw = String::from_utf8_lossy(&all_reads).to_string();
 
         Ok(NetworkResponse {
-            host: addr,
+            host: target.to_string(),
+            address: addr,
+            request: String::from_utf8_lossy(&sent_bytes).to_string(),
+            data,
             raw,
-            body,
-            duration_ms,
+            named,
+            ip,
         })
     }
 
-    async fn interleave_io<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    async fn run_conversation<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         stream: &mut S,
         inputs: &[NetworkInput],
-        read_size: Option<usize>,
-        output_buffer: &mut Vec<u8>,
+        sent_bytes: &mut Vec<u8>,
+        all_reads: &mut Vec<u8>,
+        named: &mut Vec<(String, String)>,
+        step_vars: &mut HashMap<String, String>,
+        target: &str,
         timeout: Duration,
     ) -> Result<(), String> {
-        let mut buf = vec![0u8; 4096];
-
         if inputs.is_empty() {
-            // If no inputs specified, read available banner
-            let read_limit = read_size.unwrap_or(4096);
-            buf.resize(read_limit, 0);
-            if let Ok(Ok(n)) = tokio::time::timeout(timeout, stream.read(&mut buf)).await {
-                if n > 0 {
-                    output_buffer.extend_from_slice(&buf[..n]);
-                }
-            }
             return Ok(());
         }
 
         for input in inputs {
-            if let Some(ref data) = input.data {
+            // Input data is rendered against the variable scope (named
+            // buffers from previous steps included, as in Go).
+            let rendered = match &input.data {
+                Some(data) => interpolate(data, target, step_vars),
+                None => String::new(),
+            };
+            if !rendered.is_empty() {
                 let bytes_to_send = if input.input_type.as_deref() == Some("hex") {
-                    hex::decode(data.replace(' ', "")).unwrap_or_else(|_| data.as_bytes().to_vec())
+                    hex::decode(rendered.replace(' ', ""))
+                        .unwrap_or_else(|_| rendered.as_bytes().to_vec())
                 } else {
-                    data.as_bytes().to_vec()
+                    rendered.as_bytes().to_vec()
                 };
 
-                let _ = tokio::time::timeout(timeout, stream.write_all(&bytes_to_send))
+                tokio::time::timeout(timeout, stream.write_all(&bytes_to_send))
                     .await
                     .map_err(|_| "Write timeout".to_string())?
                     .map_err(|e| format!("Write error: {}", e))?;
                 let _ = stream.flush().await;
+                sent_bytes.extend_from_slice(&bytes_to_send);
             }
 
             if let Some(read_len) = input.read {
-                let mut read_buf = vec![0u8; read_len.max(1)];
-                if let Ok(Ok(n)) = tokio::time::timeout(timeout, stream.read(&mut read_buf)).await {
-                    if n > 0 {
-                        output_buffer.extend_from_slice(&read_buf[..n]);
+                let buffer = Self::read_chunk(stream, read_len.max(1), timeout).await;
+                let buffer_str = String::from_utf8_lossy(&buffer).to_string();
+                all_reads.extend_from_slice(&buffer);
+                if let Some(name) = input.name.as_deref() {
+                    if !name.is_empty() {
+                        named.push((name.to_string(), buffer_str.clone()));
+                        step_vars.insert(name.to_string(), buffer_str);
                     }
                 }
             }
@@ -134,12 +210,40 @@ impl NetworkClient {
 
         Ok(())
     }
+
+    async fn read_chunk<S: AsyncReadExt + Unpin>(
+        stream: &mut S,
+        len: usize,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => buf.truncate(n),
+            _ => buf.clear(),
+        }
+        buf
+    }
+}
+
+/// Interpolate a network protocol field: URL-derived variables resolve first
+/// (when the target is a URL), then the supplied variable map covers
+/// {{Hostname}}-style placeholders for bare host:port targets.
+fn interpolate(input: &str, target: &str, vars: &HashMap<String, String>) -> String {
+    let mut merged = vars.clone();
+    if !merged.contains_key("Hostname") {
+        let resolved = VariableResolver::resolve("{{Hostname}}", target);
+        if !resolved.contains("{{") {
+            merged.insert("Hostname".to_string(), resolved);
+        }
+    }
+    TemplateDsl::interpolate(input, target, &merged)
 }
 
 fn parse_host_port(host_str: &str, default_port: Option<&str>) -> (String, u16) {
     let clean = host_str
         .trim_start_matches("tcp://")
         .trim_start_matches("udp://")
+        .trim_start_matches("tls://")
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/');

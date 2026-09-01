@@ -247,7 +247,20 @@ pub struct HttpBlock {
     #[serde(default)]
     pub redirects: Option<bool>,
 
-    /// Cookie reuse across requests within this block.
+    /// Whether to follow only redirects to the same host (`host-redirects`).
+    #[serde(default, rename = "host-redirects")]
+    pub host_redirects: Option<bool>,
+
+    /// Disable cookie reuse (cookie jar) for this request block.
+    #[serde(default, rename = "disable-cookie")]
+    pub disable_cookie: Option<bool>,
+
+    /// Block-level self-contained marker (request runs without target input).
+    #[serde(default, rename = "self-contained")]
+    pub self_contained: bool,
+
+    /// Cookie reuse across requests within this block. Deprecated upstream:
+    /// cookie reuse is now the default; `disable-cookie` is the switch.
     #[serde(default, rename = "cookie-reuse")]
     pub cookie_reuse: Option<bool>,
 
@@ -278,9 +291,10 @@ pub struct DnsBlock {
     #[serde(default)]
     pub resolvers: Vec<String>,
 
-    /// Trace / recursion.
+    /// Trace / recursion. Go defaults to recursion desired = true when the
+    /// field is absent; `recursion: false` disables it.
     #[serde(default)]
-    pub recursion: bool,
+    pub recursion: Option<bool>,
 
     /// Number of retries on timeout.
     #[serde(default)]
@@ -340,6 +354,11 @@ pub struct NetworkBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkInput {
+    /// Optional name: the read buffer becomes a variable under this name
+    /// (Go nuclei named input support).
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Data string to send.
     #[serde(default)]
     pub data: Option<String>,
