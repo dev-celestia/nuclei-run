@@ -11,16 +11,35 @@ use crate::engine::network_client::NetworkClient;
 use crate::engine::runner::helpers::{
     build_http_requests, has_unresolved_variables, interpolate_matchers, RequestSpec,
 };
-use crate::engine::runner::EngineRunner;
+use crate::engine::runner::{EngineRunner, RunCapture};
 use crate::engine::ssl_client::SslClient;
 use crate::engine::websocket_client::WebSocketClient;
 use crate::engine::whois_client::WhoisClient;
 use crate::models::result::ScanFinding;
-use crate::models::template::NucleiTemplate;
+use crate::models::template::{NucleiTemplate, TemplateExtractor};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Record which workflow-named extractors produced at least one value, using
+/// Go's effective extractor name (`name` or the extractor type). The merged
+/// extraction map keeps the extractor name as a key when it produced values.
+fn capture_extract_names(
+    capture: &mut RunCapture,
+    extractors: &[TemplateExtractor],
+    extracted: &HashMap<String, String>,
+) {
+    for ext in extractors {
+        let eff = ext
+            .name
+            .clone()
+            .unwrap_or_else(|| ext.extractor_type.clone());
+        if extracted.contains_key(&eff) {
+            capture.extract_names.push(eff.to_lowercase());
+        }
+    }
+}
 
 impl EngineRunner {
     pub async fn execute_dns(
@@ -28,6 +47,7 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for dns_block in &template.dns {
@@ -53,6 +73,9 @@ impl EngineRunner {
                     "raw",
                     duration_secs,
                 );
+                if let Some(c) = capture.as_deref_mut() {
+                    capture_extract_names(c, &dns_block.extractors, &new_extractions);
+                }
                 extracted_vars.extend(new_extractions);
 
                 if dns_block.matchers.is_empty() {
@@ -75,6 +98,13 @@ impl EngineRunner {
                 if has_non_internal_matchers
                     && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp)
                 {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let output_values = ExtractorEngine::extract_output_from_parts(
                         &dns_block.extractors,
                         &vars,
@@ -103,6 +133,7 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for net_block in &template.network {
@@ -128,6 +159,9 @@ impl EngineRunner {
                     "data",
                     duration_secs,
                 );
+                if let Some(c) = capture.as_deref_mut() {
+                    capture_extract_names(c, &net_block.extractors, &new_extractions);
+                }
                 extracted_vars.extend(new_extractions);
 
                 if net_block.matchers.is_empty() {
@@ -150,6 +184,13 @@ impl EngineRunner {
                 if has_non_internal_matchers
                     && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp)
                 {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let output_values = ExtractorEngine::extract_output_from_parts(
                         &net_block.extractors,
                         &vars,
@@ -178,6 +219,7 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for ssl_block in &template.ssl {
@@ -203,6 +245,9 @@ impl EngineRunner {
                     "response",
                     duration_secs,
                 );
+                if let Some(c) = capture.as_deref_mut() {
+                    capture_extract_names(c, &ssl_block.extractors, &new_extractions);
+                }
                 extracted_vars.extend(new_extractions);
 
                 if ssl_block.matchers.is_empty() {
@@ -225,6 +270,13 @@ impl EngineRunner {
                 if has_non_internal_matchers
                     && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp)
                 {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let output_values = ExtractorEngine::extract_output_from_parts(
                         &ssl_block.extractors,
                         &vars,
@@ -252,6 +304,7 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for whois_block in &template.whois {
@@ -276,6 +329,13 @@ impl EngineRunner {
                 };
                 let condition = whois_block.matchers_condition.as_deref().unwrap_or("or");
                 if MatcherEngine::evaluate_all(&whois_block.matchers, condition, &eval_resp) {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &whois_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -297,6 +357,7 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for file_block in &template.file {
@@ -318,6 +379,13 @@ impl EngineRunner {
                 };
                 let condition = file_block.matchers_condition.as_deref().unwrap_or("or");
                 if MatcherEngine::evaluate_all(&file_block.matchers, condition, &eval_resp) {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &file_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -339,6 +407,7 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for code_block in &template.code {
@@ -363,6 +432,13 @@ impl EngineRunner {
                 };
                 let condition = code_block.matchers_condition.as_deref().unwrap_or("or");
                 if MatcherEngine::evaluate_all(&code_block.matchers, condition, &eval_resp) {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &code_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -384,6 +460,7 @@ impl EngineRunner {
         &self,
         template: &NucleiTemplate,
         target: &str,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for ws_block in &template.websocket {
@@ -407,6 +484,13 @@ impl EngineRunner {
                 };
                 let condition = ws_block.matchers_condition.as_deref().unwrap_or("or");
                 if MatcherEngine::evaluate_all(&ws_block.matchers, condition, &eval_resp) {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &ws_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -429,6 +513,7 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         extracted_vars: &HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for headless_block in &template.headless {
@@ -456,6 +541,13 @@ impl EngineRunner {
                 };
                 let condition = headless_block.matchers_condition.as_deref().unwrap_or("or");
                 if MatcherEngine::evaluate_all(&headless_block.matchers, condition, &eval_resp) {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &headless_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -478,6 +570,7 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for js_block in &template.javascript {
@@ -508,6 +601,13 @@ impl EngineRunner {
                 if has_non_internal_matchers
                     && MatcherEngine::evaluate_all(&js_block.matchers, condition, &eval_resp)
                 {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &js_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -530,6 +630,7 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for http_block in &template.http {
@@ -659,6 +760,9 @@ impl EngineRunner {
 
                 let new_extractions =
                     ExtractorEngine::extract_all(&http_block.extractors, &response);
+                if let Some(c) = capture.as_deref_mut() {
+                    capture_extract_names(c, &http_block.extractors, &new_extractions);
+                }
                 extracted_vars.extend(new_extractions);
 
                 // Register for OOB correlation when this request carried
@@ -701,6 +805,13 @@ impl EngineRunner {
                 let is_match = MatcherEngine::evaluate_all(&matchers, condition, &eval_resp);
 
                 if is_match {
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.record_matcher(MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ));
+                    }
                     if has_non_internal_matchers {
                         let output_values = ExtractorEngine::extract_output_values(
                             &http_block.extractors,
@@ -720,7 +831,11 @@ impl EngineRunner {
                             matched_at: chrono::Utc::now().to_rfc3339(),
                             extracted_results: output_values,
                             protocol: "http".to_string(),
-                            matcher_name: None,
+                            matcher_name: MatcherEngine::matched_matcher_name(
+                                &matchers,
+                                condition,
+                                &eval_resp,
+                            ),
                             tags: template.info.tags.clone(),
                         };
 

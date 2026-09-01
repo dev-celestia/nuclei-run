@@ -471,7 +471,10 @@ async fn main() {
             scan_config.follow_redirects,
             scan_config.follow_host_redirects,
             scan_config.disable_redirects,
-        ),
+        )
+        .with_workflow_registry(Arc::new(
+            engine::workflow::WorkflowTemplateRegistry::new(templates_arc.clone()),
+        )),
     );
 
     // Set up finding channel.

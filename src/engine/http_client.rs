@@ -291,7 +291,7 @@ async fn parse_response(response: reqwest::Response, duration_secs: f64) -> Http
         headers_map.insert(key.as_str().to_lowercase(), v.to_string());
     }
 
-    let body = response.text().await.unwrap_or_default();
+    let body = read_body_limited(response).await;
 
     HttpResponse {
         status,
@@ -300,6 +300,31 @@ async fn parse_response(response: reqwest::Response, duration_secs: f64) -> Http
         headers_map,
         duration_secs,
     }
+}
+
+/// Default cap on HTTP response body bytes retained for matching, mirroring
+/// Go nuclei's `MaxBodyRead` (pkg/protocols/http/request.go).
+const MAX_BODY_READ: usize = 10 * 1024 * 1024;
+
+/// Stream the response body in chunks, stopping once `MAX_BODY_READ` bytes are
+/// buffered so oversized responses do not exhaust memory.
+async fn read_body_limited(mut response: reqwest::Response) -> String {
+    let mut body = String::new();
+    let mut remaining = MAX_BODY_READ;
+    while remaining > 0 {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if chunk.len() >= remaining {
+                    body.push_str(&String::from_utf8_lossy(&chunk[..remaining]));
+                    break;
+                }
+                body.push_str(&String::from_utf8_lossy(&chunk));
+                remaining -= chunk.len();
+            }
+            _ => break,
+        }
+    }
+    body
 }
 
 /// Parsed components of a raw HTTP request.
@@ -325,7 +350,7 @@ fn parse_raw_request(raw: &str, target_url: &str) -> Result<ParsedRawRequest, St
         (normalized.as_str(), None)
     };
 
-    let mut lines = header_section.lines();
+    let mut lines = header_section.lines().filter(|l| !l.trim_start().starts_with('@'));
 
     // First line: METHOD PATH HTTP/1.1
     let request_line = lines.next().ok_or("Empty raw request")?;
@@ -359,16 +384,15 @@ fn parse_raw_request(raw: &str, target_url: &str) -> Result<ParsedRawRequest, St
         }
     };
 
-    // Parse remaining lines as headers.
+    // Parse remaining lines as headers. A template-specified Host header is
+    // preserved (Go nuclei keeps it and only fills it from the target URL when
+    // absent) — reqwest honors an explicit Host header for vhost testing.
     let mut headers = HashMap::new();
     for line in lines {
         if let Some(colon_pos) = line.find(':') {
             let key = line[..colon_pos].trim().to_string();
             let value = line[colon_pos + 1..].trim().to_string();
-            // Skip the Host header since reqwest sets it from the URL.
-            if key.to_lowercase() != "host" {
-                headers.insert(key, value);
-            }
+            headers.insert(key, value);
         }
     }
 
@@ -420,9 +444,22 @@ mod tests {
         let parsed = parse_raw_request(raw, "http://target-host.com").unwrap();
         assert_eq!(parsed.method, "GET");
         assert_eq!(parsed.url, "http://target-host.com/path");
-        assert!(!parsed.headers.contains_key("Host") && !parsed.headers.contains_key("host"));
+        // The template-specified Host header is preserved (Go parity).
+        assert_eq!(parsed.headers.get("Host").map(|s| s.as_str()), Some("example.com"));
         assert_eq!(parsed.headers.get("X-A").map(|s| s.as_str()), Some("b"));
         assert_eq!(parsed.body, None);
+    }
+
+    #[test]
+    fn test_parse_raw_request_skips_annotations() {
+        // `@`-prefixed lines are annotations and must be ignored (Go parity).
+        let raw = "@Host: http://annotated.example.com\nGET /path HTTP/1.1\nHost: target.com\nX-A: b\n\n";
+        let parsed = parse_raw_request(raw, "http://target-host.com").unwrap();
+        assert_eq!(parsed.method, "GET");
+        assert_eq!(parsed.url, "http://target-host.com/path");
+        assert_eq!(parsed.headers.get("Host").map(|s| s.as_str()), Some("target.com"));
+        assert_eq!(parsed.headers.get("X-A").map(|s| s.as_str()), Some("b"));
+        assert!(!parsed.headers.contains_key("@Host") && !parsed.headers.contains_key("Host: http://annotated.example.com"));
     }
 
     #[test]

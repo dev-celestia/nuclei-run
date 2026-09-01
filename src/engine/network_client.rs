@@ -9,6 +9,49 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+#[derive(Debug)]
+struct NoVerifyCert;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
 /// Network protocol execution response.
 ///
 /// Field semantics mirror Go nuclei's `responseToDSLMap`
@@ -92,14 +135,13 @@ impl NetworkClient {
         let mut step_vars: HashMap<String, String> = extra_vars.clone();
 
         // Go always performs a final read after the input steps
-        // (`bufferSize` = read-size or 1024); its content is the `data` part.
-        let final_size = block.read_size.unwrap_or(1024).max(1);
+        // (`bufferSize` = read-size or 1024, or all available when
+        // `read-all` is set); its content is the `data` part.
         let final_chunk;
-
         if block.tls {
-            let root_cert_store = rustls::RootCertStore::empty();
             let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifyCert))
                 .with_no_client_auth();
 
             let connector = TlsConnector::from(Arc::new(config));
@@ -125,7 +167,7 @@ impl NetworkClient {
             )
             .await?;
 
-            final_chunk = Self::read_chunk(&mut tls_stream, final_size, timeout).await;
+            final_chunk = Self::final_read(&mut tls_stream, block, timeout).await;
         } else {
             let mut stream = stream;
             Self::run_conversation(
@@ -140,7 +182,7 @@ impl NetworkClient {
             )
             .await?;
 
-            final_chunk = Self::read_chunk(&mut stream, final_size, timeout).await;
+            final_chunk = Self::final_read(&mut stream, block, timeout).await;
         }
 
         let data = String::from_utf8_lossy(&final_chunk).to_string();
@@ -222,6 +264,32 @@ impl NetworkClient {
             _ => buf.clear(),
         }
         buf
+    }
+
+    /// Final read after the input steps. When `read-all` is set, keeps reading
+    /// until EOF, error, or the timeout expires; otherwise reads a single
+    /// fixed-size chunk (Go `read-size`, default 1024).
+    async fn final_read<S: AsyncReadExt + Unpin>(
+        stream: &mut S,
+        block: &NetworkBlock,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        if block.read_all {
+            let mut all = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => all.extend_from_slice(&buf[..n]),
+                    Ok(Err(_)) => break,
+                    Err(_) => break,
+                }
+            }
+            all
+        } else {
+            let final_size = block.read_size.unwrap_or(1024).max(1);
+            Self::read_chunk(stream, final_size, timeout).await
+        }
     }
 }
 

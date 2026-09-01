@@ -117,6 +117,34 @@ impl MatcherEngine {
             _ => matchers.iter().any(|m| Self::evaluate(m, resp)), // Default: "or"
         }
     }
+
+    /// Name of a matcher responsible for a match, respecting the top-level
+    /// `matchers-condition`. Returns the first named matcher that contributes
+    /// to the match (or the first matching matcher when unnamed). Used to
+    /// populate the `matcher_name` field of a finding.
+    pub fn matched_matcher_name(
+        matchers: &[TemplateMatcher],
+        condition: &str,
+        resp: &EvaluatedResponse,
+    ) -> Option<String> {
+        if matchers.is_empty() {
+            return None;
+        }
+        let first_named = matchers
+            .iter()
+            .filter(|m| Self::evaluate(m, resp))
+            .find_map(|m| m.name.clone());
+        match condition.to_lowercase().as_str() {
+            "and" => {
+                if matchers.iter().all(|m| Self::evaluate(m, resp)) {
+                    first_named
+                } else {
+                    None
+                }
+            }
+            _ => first_named,
+        }
+    }
 }
 
 /// Lowercase matcher word bytes like Go's `strings.ToLower` (Unicode-aware

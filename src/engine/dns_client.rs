@@ -51,6 +51,8 @@ impl DnsResponse {
         vars.insert("ns".to_string(), self.ns.clone());
         vars.insert("extra".to_string(), self.extra.clone());
         vars.insert("raw".to_string(), self.raw.clone());
+        // Go `type` is the protocol type ("dns"), not the query record type.
+        vars.insert("type".to_string(), "dns".to_string());
         // Trace is not implemented; Go exposes an empty string in that case.
         vars.insert("trace".to_string(), String::new());
 
@@ -316,7 +318,6 @@ fn build_response(
 
     DnsResponse {
         host: domain.to_string(),
-        query_type: query_type_str.to_string(),
         rcode,
         question,
         answer,
@@ -398,7 +399,6 @@ mod tests {
     fn test_variables_single_and_multi_record() {
         let resp = DnsResponse {
             host: "example.com".to_string(),
-            query_type: "A".to_string(),
             rcode: 0,
             question: ";example.com.\tIN\t A".to_string(),
             answer: "example.com.\t300\tIN\tA\t1.2.3.4".to_string(),
@@ -419,5 +419,6 @@ mod tests {
         assert_eq!(vars.get("a").map(String::as_str), Some("[1.2.3.4 5.6.7.8]"));
         assert!(vars.contains_key("raw"));
         assert_eq!(vars.get("trace").map(String::as_str), Some(""));
+        assert_eq!(vars.get("type").map(String::as_str), Some("dns"));
     }
 }

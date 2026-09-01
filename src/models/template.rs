@@ -77,6 +77,91 @@ pub struct NucleiTemplate {
     /// Template-level constants for substitution.
     #[serde(default)]
     pub constants: HashMap<String, serde_yaml::Value>,
+
+    /// Workflow steps (Go `workflows:`). A template with workflow steps has no
+    /// protocol blocks of its own; each step references other templates by
+    /// path or tags and optionally gates subtemplates on named matcher results.
+    #[serde(default)]
+    pub workflows: Vec<WorkflowStep>,
+
+    /// Absolute path of the source YAML file (populated by the loader, used
+    /// for resolving workflow step `template:` references). Not serialized.
+    #[serde(skip)]
+    pub source_path: Option<String>,
+}
+
+/// A single workflow step, mirroring Go `workflows.WorkflowTemplate`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    /// Template path or directory to execute (mutually exclusive with `tags`).
+    #[serde(default)]
+    pub template: Option<String>,
+
+    /// Tags to pull in matching templates (Go `stringslice.StringSlice`:
+    /// scalar or list).
+    #[serde(default)]
+    pub tags: FlexibleStringList,
+
+    /// Named-matcher gates: when a matcher matches, its `subtemplates` run.
+    #[serde(default)]
+    pub matchers: Vec<WorkflowMatcher>,
+
+    /// Direct subtemplates, run only if this step produced any result.
+    #[serde(default)]
+    pub subtemplates: Vec<WorkflowStep>,
+}
+
+impl WorkflowStep {
+    /// Resolved tag selector for this step (empty when none specified).
+    pub fn tag_list(&self) -> Vec<String> {
+        match &self.tags {
+            FlexibleStringList::Single(s) => s
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            FlexibleStringList::List(v) => v.clone(),
+        }
+    }
+}
+
+/// A name-based gate on a workflow step's results, mirroring Go
+/// `workflows.Matcher`. A step template is satisfied by a matcher OR an
+/// extractor with a matching name (case-insensitive).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowMatcher {
+    /// Matcher/extractor names to look for (scalar or list).
+    #[serde(default)]
+    pub name: FlexibleStringList,
+
+    /// "and" | "or" (default "or").
+    #[serde(default)]
+    pub condition: Option<String>,
+
+    /// Subtemplates to run when this matcher is satisfied.
+    #[serde(default)]
+    pub subtemplates: Vec<WorkflowStep>,
+}
+
+impl WorkflowMatcher {
+    /// Matcher names as a list.
+    pub fn name_list(&self) -> Vec<String> {
+        match &self.name {
+            FlexibleStringList::Single(s) => s
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            FlexibleStringList::List(v) => v.clone(),
+        }
+    }
+
+    /// Whether the AND/OR condition is `and` (defaults to `or`).
+    pub fn is_and(&self) -> bool {
+        self.condition
+            .as_deref()
+            .map_or(false, |c| c.eq_ignore_ascii_case("and"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +423,10 @@ pub struct NetworkBlock {
     /// Expected read size in bytes.
     #[serde(default, rename = "read-size")]
     pub read_size: Option<usize>,
+
+    /// Read all available data (Go `read-all: true`).
+    #[serde(default, rename = "read-all")]
+    pub read_all: bool,
 
     /// Matchers condition ("and" or "or").
     #[serde(default, rename = "matchers-condition")]

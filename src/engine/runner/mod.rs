@@ -1,6 +1,7 @@
 pub mod flow_exec;
 pub mod helpers;
 pub mod protocols;
+pub mod workflow_exec;
 
 #[allow(unused_imports)]
 pub use helpers::{has_unresolved_variables, interpolate_matchers, yaml_value_to_string, RequestSpec};
@@ -10,6 +11,7 @@ use crate::engine::host_errors::HostErrorsCache;
 use crate::engine::http_client::{HttpClient, HttpResponse};
 use crate::engine::interactsh::{evaluate_interaction, InteractshClient, PendingRequest};
 use crate::engine::runner::helpers::{INTERACTSH_COOLDOWN_SECS, INTERACTSH_POLL_SECS};
+use crate::engine::workflow::WorkflowTemplateRegistry;
 use crate::models::result::ScanFinding;
 use crate::models::template::{HttpBlock, NucleiTemplate};
 use governor::{Quota, RateLimiter};
@@ -23,6 +25,42 @@ use tokio::sync::mpsc;
 pub struct ScanTask {
     pub target: String,
     pub template: Arc<NucleiTemplate>,
+}
+
+/// Result capture used by workflow execution to gate subtemplates on named
+/// matcher/extractor results (Go `operators.Result` semantics). Populated
+/// only when a workflow step template is executed.
+#[derive(Debug, Default, Clone)]
+pub struct RunCapture {
+    /// Whether any non-internal matcher matched.
+    pub matched: bool,
+    /// Names (lowercased) of matchers that matched.
+    pub matched_matchers: Vec<String>,
+    /// Names of extractors that produced at least one value.
+    pub extract_names: Vec<String>,
+}
+
+impl RunCapture {
+    /// Go `Result.HasMatch(name)` — case-insensitive name lookup.
+    pub fn has_match(&self, name: &str) -> bool {
+        self.matched_matchers
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(name))
+    }
+
+    /// Go `Result.HasExtract(name)` — case-insensitive name lookup.
+    pub fn has_extract(&self, name: &str) -> bool {
+        self.extract_names
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(name))
+    }
+
+    fn record_matcher(&mut self, name: Option<String>) {
+        self.matched = true;
+        if let Some(n) = name {
+            self.matched_matchers.push(n.to_lowercase());
+        }
+    }
 }
 
 /// The core scan engine orchestrating concurrent template execution.
@@ -45,6 +83,8 @@ pub struct EngineRunner {
     pub disable_redirects: bool,
     /// Global `-mr` / `--max-redirects` (overrides per-block caps when set).
     pub global_max_redirects: usize,
+    /// Registry of loaded templates for resolving workflow step references.
+    pub workflow_registry: Option<Arc<WorkflowTemplateRegistry>>,
 }
 
 impl EngineRunner {
@@ -76,7 +116,15 @@ impl EngineRunner {
             follow_host_redirects: false,
             disable_redirects: false,
             global_max_redirects: max_redirects,
+            workflow_registry: None,
         }
+    }
+
+    /// Provide the registry of loaded templates so workflow steps can resolve
+    /// their referenced templates by tag or path at execution time.
+    pub fn with_workflow_registry(mut self, registry: Arc<WorkflowTemplateRegistry>) -> Self {
+        self.workflow_registry = Some(registry);
+        self
     }
 
     /// Set the global redirect flags (mirrors Go `-fr`/`-fhr`/`-dr`).
@@ -252,6 +300,17 @@ impl EngineRunner {
         .collect();
         extracted_vars.insert("randstr".to_string(), randstr);
 
+        // Template-level `constants:` are resolved first (Go adds them to the
+        // template context before variables are evaluated).
+        for (name, value) in &template.constants {
+            if let Some(s) = yaml_value_to_string(value) {
+                extracted_vars.insert(
+                    name.clone(),
+                    TemplateDsl::interpolate(&s, target, &HashMap::new()),
+                );
+            }
+        }
+
         // Template-level `variables:` are resolved once per execution and are
         // available to all requests (extracted values can override them later).
         for (name, value) in &template.variables {
@@ -261,6 +320,27 @@ impl EngineRunner {
                     TemplateDsl::interpolate(&s, target, &HashMap::new()),
                 );
             }
+        }
+
+        // Workflow-controlled templates execute their steps (which reference
+        // other templates) instead of running protocol blocks directly.
+        if !template.workflows.is_empty() {
+            if let Some(registry) = self.workflow_registry.clone() {
+                self.execute_workflow(
+                    &template.workflows,
+                    target,
+                    &mut extracted_vars,
+                    registry,
+                    result_tx,
+                )
+                .await;
+            } else {
+                eprintln!(
+                    "[WRN] Workflow '{}' loaded without a template registry; skipped",
+                    template.id
+                );
+            }
+            return;
         }
 
         // Flow-controlled templates execute exclusively through their flow
@@ -274,38 +354,60 @@ impl EngineRunner {
             return;
         }
 
+        self.execute_protocols(template, target, &mut extracted_vars, None, result_tx)
+            .await;
+    }
+
+    /// Run all protocol blocks of a template against a target. When `capture`
+    /// is `Some`, wrapper results (matched matchers, extractor names) are
+    /// recorded for workflow gating.
+    pub async fn execute_protocols(
+        &self,
+        template: &NucleiTemplate,
+        target: &str,
+        extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
+        result_tx: &mpsc::Sender<ScanFinding>,
+    ) {
         // 1. DNS Protocol Execution
-        self.execute_dns(template, target, &mut extracted_vars, result_tx)
+        self.execute_dns(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
             .await;
 
         // 2. Network / TCP Protocol Execution
-        self.execute_network(template, target, &mut extracted_vars, result_tx)
+        self.execute_network(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
             .await;
 
         // 3. SSL / TLS Protocol Execution
-        self.execute_ssl(template, target, &mut extracted_vars, result_tx)
+        self.execute_ssl(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
             .await;
 
         // 4. WHOIS Protocol Execution
-        self.execute_whois(template, target, result_tx).await;
+        self.execute_whois(template, target, capture.as_deref_mut(), result_tx)
+            .await;
 
         // 5. File Protocol Execution
-        self.execute_file(template, target, result_tx).await;
+        self.execute_file(template, target, capture.as_deref_mut(), result_tx)
+            .await;
 
         // 6. Code Execution Protocol
-        self.execute_code(template, target, result_tx).await;
+        self.execute_code(template, target, capture.as_deref_mut(), result_tx)
+            .await;
 
         // 7. WebSocket Protocol Execution
-        self.execute_websocket(template, target, result_tx).await;
+        self.execute_websocket(template, target, capture.as_deref_mut(), result_tx)
+            .await;
 
         // 8. Headless Browser Protocol Execution
-        self.execute_headless(template, target, &extracted_vars, result_tx).await;
+        self.execute_headless(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
+            .await;
 
         // 9. JavaScript Protocol Execution
-        self.execute_js(template, target, &mut extracted_vars, result_tx).await;
+        self.execute_js(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
+            .await;
 
         // 10. HTTP Request Blocks & Parameter Fuzzing
-        self.execute_http(template, target, &mut extracted_vars, result_tx).await;
+        self.execute_http(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
+            .await;
     }
 
     /// Replace `{{interactsh-url}}` markers with freshly generated correlation

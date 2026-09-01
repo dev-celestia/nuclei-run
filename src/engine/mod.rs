@@ -22,3 +22,4 @@ pub mod uncover;
 pub mod variables;
 pub mod websocket_client;
 pub mod whois_client;
+pub mod workflow;

@@ -34,16 +34,30 @@ pub enum MatchCondition {
 pub fn get_part<'a>(matcher: &TemplateMatcher, resp: &'a EvaluatedResponse) -> Cow<'a, str> {
     match matcher.part.as_deref().unwrap_or("body") {
         "header" | "all_headers" => Cow::Borrowed(resp.headers),
+        "all" => {
+            // Go: body + all_headers concatenated.
+            let mut full = String::with_capacity(resp.body.len() + resp.headers.len() + 1);
+            full.push_str(resp.body);
+            if !resp.headers.is_empty() {
+                full.push('\n');
+                full.push_str(resp.headers);
+            }
+            Cow::Owned(full)
+        }
         "response" => {
-            // "response" means the full HTTP response (headers + body). For
-            // header-less protocols (ssl/dns/network) the body already is the
-            // response payload, so no concatenation happens.
-            if resp.headers.is_empty() {
+            // Go: FullResponseString() — status line + raw headers + body
+            // with \r\n wire format. For header-less protocols (ssl/dns/network)
+            // the body already is the response payload, so no prepending.
+            if resp.headers.is_empty() && resp.body.is_empty() {
                 return Cow::Borrowed(resp.body);
             }
-            let mut full = String::with_capacity(resp.headers.len() + resp.body.len() + 1);
-            full.push_str(resp.headers);
-            full.push('\n');
+            let mut full =
+                String::with_capacity(20 + resp.headers.len() + resp.body.len() + 2);
+            full.push_str(&format!("HTTP/1.1 {}\r\n", resp.status));
+            if !resp.headers.is_empty() {
+                full.push_str(&resp.headers.replace('\n', "\r\n"));
+                full.push_str("\r\n");
+            }
             full.push_str(resp.body);
             Cow::Owned(full)
         }

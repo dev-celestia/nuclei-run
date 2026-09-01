@@ -44,10 +44,11 @@ pub fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoa
         }
     }
 
-    let template: NucleiTemplate = match serde_yaml::from_str(&content) {
+    let mut template: NucleiTemplate = match serde_yaml::from_str(&content) {
         Ok(t) => t,
         Err(e) => return TemplateLoadOutcome::ParseError(e.to_string()),
     };
+    template.source_path = path.to_string_lossy().into_owned().into();
 
     // Capability gate: self-contained templates are excluded unless `-esc`
     // is set (Go: capability.go `CapabilitySelfContained`, loadBlocking).
@@ -55,7 +56,7 @@ pub fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoa
         return TemplateLoadOutcome::SelfContainedExcluded;
     }
 
-    // Ensure template has at least one executable block.
+    // Ensure template has at least one executable block (or is a workflow).
     let has_executable_blocks = !template.http.is_empty()
         || !template.dns.is_empty()
         || !template.network.is_empty()
@@ -67,6 +68,7 @@ pub fn load_single_template(path: &Path, filter: &TemplateFilter) -> TemplateLoa
         || !template.javascript.is_empty()
         || !template.headless.is_empty()
         || !template.fuzzing.is_empty()
+        || !template.workflows.is_empty()
         || template.flow.is_some();
 
     if !has_executable_blocks {

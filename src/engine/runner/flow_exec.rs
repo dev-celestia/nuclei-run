@@ -59,6 +59,46 @@ impl EngineRunner {
         let _ = result_tx.send(finding).await;
     }
 
+    /// Flow variant used by workflow steps: evaluates the flow and records the
+    /// aggregate match into a capture (named matcher/extractor gating for flow
+    /// templates is best-effort, matching only the boolean outcome).
+    pub async fn execute_flow_capture(
+        &self,
+        node: &FlowNode,
+        template: &NucleiTemplate,
+        target: &str,
+        extracted_vars: &mut HashMap<String, String>,
+        capture: &mut crate::engine::runner::RunCapture,
+        result_tx: &mpsc::Sender<ScanFinding>,
+    ) {
+        let mut ctx = FlowMatchContext {
+            matched_url: None,
+            extracted: Vec::new(),
+            protocol: "http".to_string(),
+        };
+
+        let matched = self
+            .eval_flow_node(node, template, target, extracted_vars, &mut ctx, result_tx)
+            .await;
+        if !matched {
+            return;
+        }
+
+        capture.matched = true;
+
+        let finding = ScanFinding {
+            template_id: template.id.clone(),
+            template_name: template.info.name.clone(),
+            severity: template.info.severity.to_lowercase(),
+            matched_url: ctx.matched_url.unwrap_or_else(|| target.to_string()),
+            matched_at: chrono::Utc::now().to_rfc3339(),
+            extracted_results: ctx.extracted,
+            protocol: ctx.protocol,
+            matcher_name: None,
+            tags: template.info.tags.clone(),
+        };
+        let _ = result_tx.send(finding).await;
+    }
     /// Recursively evaluate a flow node with short-circuit `&&` / `||`
     /// semantics (mirroring nuclei's goja evaluation).
     pub fn eval_flow_node<'a>(
@@ -262,7 +302,9 @@ impl EngineRunner {
                 interactsh_request: None,
                 interactsh_response: None,
                 duration_secs: response.duration_secs,
-                named_parts: None,
+                // Extracted values are visible to DSL matchers, matching the
+                // non-flow execution path (Go merges them into the data map).
+                named_parts: Some(extracted_vars),
             };
 
             let condition = block.matchers_condition.as_deref().unwrap_or("or");

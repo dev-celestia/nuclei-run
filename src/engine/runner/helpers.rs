@@ -49,8 +49,9 @@ pub fn has_unresolved_variables(s: &str) -> bool {
     while let Some(start) = rest.find("{{") {
         if let Some(end) = rest[start..].find("}}") {
             let inner = &rest[start + 2..start + end];
-            // Skip empty braces and known URL-safe patterns.
-            if !inner.is_empty() && !inner.contains("http") {
+            // Skip empty braces and inline absolute URLs (a `://` inside the
+            // placeholder means it is a literal URL, not an unresolved var).
+            if !inner.is_empty() && !inner.contains("://") {
                 return true;
             }
             rest = &rest[start + end + 2..];
@@ -199,7 +200,9 @@ status:
     fn test_has_unresolved_variables() {
         assert!(has_unresolved_variables("{{var}}"));
         assert!(has_unresolved_variables("{{BaseURL}}/x"));
+        assert!(has_unresolved_variables("{{http_url}}"));
         assert!(!has_unresolved_variables("http://host"));
+        assert!(!has_unresolved_variables("{{http://absolute.example}}"));
         assert!(!has_unresolved_variables("{{}}"));
         assert!(!has_unresolved_variables("literal"));
         assert!(has_unresolved_variables("prefix {{x}} suffix"));

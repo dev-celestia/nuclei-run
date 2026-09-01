@@ -2,6 +2,7 @@ use crate::models::template::WebSocketBlock;
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Clone)]
@@ -41,7 +42,23 @@ impl WebSocketClient {
 
         let timeout = Duration::from_secs(timeout_secs.max(1));
 
-        let connect_fut = connect_async(&full_url);
+        // Build the handshake request so template-specified headers are sent
+        // (Go renders and applies all `headers:` to the WebSocket dialer).
+        let mut request = full_url
+            .clone()
+            .into_client_request()
+            .map_err(|e| format!("Invalid WebSocket URL {}: {}", full_url, e))?;
+        for (key, value) in &block.headers {
+            let header_value: tokio_tungstenite::tungstenite::http::HeaderValue = value
+                .parse()
+                .map_err(|_| format!("Invalid WebSocket header: {}", key))?;
+            let header_name: tokio_tungstenite::tungstenite::http::HeaderName = key
+                .parse()
+                .map_err(|_| format!("Invalid WebSocket header name: {}", key))?;
+            request.headers_mut().insert(header_name, header_value);
+        }
+
+        let connect_fut = connect_async(request);
         let (mut ws_stream, _) = tokio::time::timeout(timeout, connect_fut)
             .await
             .map_err(|_| format!("WebSocket connection timeout for {}", full_url))?

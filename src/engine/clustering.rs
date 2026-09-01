@@ -102,6 +102,8 @@ mod tests {
             self_contained: false,
             variables: Default::default(),
             constants: Default::default(),
+            workflows: vec![],
+            source_path: None,
         });
 
         let t2 = Arc::new(NucleiTemplate {
@@ -151,6 +153,8 @@ mod tests {
             self_contained: false,
             variables: Default::default(),
             constants: Default::default(),
+            workflows: vec![],
+            source_path: None,
         });
 
         let targets = vec!["https://example.com".to_string()];
