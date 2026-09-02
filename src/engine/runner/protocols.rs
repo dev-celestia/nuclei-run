@@ -235,9 +235,11 @@ impl EngineRunner {
                 let duration_secs = started.elapsed().as_secs_f64();
 
                 // Go-parity variable map: tlsx fields by json tag plus the
-                // full `response` JSON (the default match part).
+                // full `response` JSON (the default match part). `duration` is
+                // measured here (Go `data["duration"] = duration.Seconds()`).
                 let mut vars = extracted_vars.clone();
                 vars.extend(ssl_resp.variables());
+                vars.insert("duration".to_string(), duration_secs.to_string());
 
                 let new_extractions = ExtractorEngine::extract_from_parts(
                     &ssl_block.extractors,

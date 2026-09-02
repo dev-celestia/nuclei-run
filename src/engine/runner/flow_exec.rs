@@ -467,6 +467,7 @@ impl EngineRunner {
 
         let mut vars = extracted_vars.clone();
         vars.extend(ssl_resp.variables());
+        vars.insert("duration".to_string(), duration_secs.to_string());
         let new_extractions = ExtractorEngine::extract_from_parts(
             &block.extractors,
             &vars,

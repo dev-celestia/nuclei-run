@@ -2,6 +2,8 @@
 .DS_Store
 .env
 *.pem
+# Deterministic test fixtures are intentionally committed for offline e2e parity.
+!/tests/fixtures/ssl/*.pem
 
 /docs
 /reference
