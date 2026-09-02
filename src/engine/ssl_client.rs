@@ -330,7 +330,32 @@ impl SslClient {
         };
 
         // Inspect any certificate, including self-signed/expired ones.
-        let config = rustls::ClientConfig::builder()
+        // Honor the template's min/max TLS version and cipher-suite filters
+        // (Go passes these to tlsx; a handshake that cannot satisfy them fails,
+        // yielding no result — same as Go returning an error).
+        let mut provider = rustls::crypto::ring::default_provider();
+        if !block.cipher_suites.is_empty() {
+            // Restrict the provider to the template's requested suites. Filtering
+            // the default provider list keeps kx groups / RNG / signature algs
+            // intact while only limiting which suites may be negotiated.
+            provider.cipher_suites.retain(|suite| {
+                let name = go_cipher_name(suite.suite());
+                block
+                    .cipher_suites
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&name))
+            });
+        }
+
+        let versions = resolve_tls_versions(
+            block.min_version.as_deref(),
+            block.max_version.as_deref(),
+        )
+        .ok_or_else(|| "no supported TLS version in configured range".to_string())?;
+
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&versions)
+            .map_err(|e| format!("invalid TLS version configuration: {}", e))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifyCert))
             .with_no_client_auth();
@@ -722,6 +747,64 @@ fn go_cipher_name(suite: rustls::CipherSuite) -> String {
     }
 }
 
+/// Map a tlsx/TLS version name ("tls13", "tls12", ...) to the rustls
+/// static `SupportedProtocolVersion`. rustls only ships TLS 1.2/1.3, so older
+/// versions map to `None` (they cannot be negotiated and are filtered out).
+fn tls_version_static(name: &str) -> Option<&'static rustls::SupportedProtocolVersion> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "tls13" | "1.3" => Some(&rustls::version::TLS13),
+        "tls12" | "1.2" => Some(&rustls::version::TLS12),
+        _ => None,
+    }
+}
+
+/// Resolve the effective rustls protocol-version list from the template's
+/// `min_version`/`max_version` fields (Go passes these straight to tlsx).
+/// Returns `None` when every configured version is unsupported by rustls
+/// (e.g. only tls10/sslv3), which the caller treats as "probe cannot run".
+fn resolve_tls_versions(
+    min: Option<&str>,
+    max: Option<&str>,
+) -> Option<Vec<&'static rustls::SupportedProtocolVersion>> {
+    // Rank supported versions (higher is newer).
+    let all: [&'static rustls::SupportedProtocolVersion; 2] =
+        [&rustls::version::TLS12, &rustls::version::TLS13];
+    let rank = |v: &'static rustls::SupportedProtocolVersion| match v.version {
+        rustls::ProtocolVersion::TLSv1_3 => 3u8,
+        rustls::ProtocolVersion::TLSv1_2 => 2,
+        _ => 0,
+    };
+
+    // min is a lower bound: unspecified or an old/unknown version ranks 0.
+    let min_rank = min
+        .map(|m| tls_version_static(m).map(rank).unwrap_or(0))
+        .unwrap_or(0);
+    // max is an upper bound: unspecified ranks 3 (TLS 1.3); an old/unknown
+    // explicit max ranks 0 (can only be satisfied by versions rustls lacks).
+    let max_rank = max
+        .map(|m| tls_version_static(m).map(rank).unwrap_or(0))
+        .unwrap_or(3);
+
+    // Inverted or impossible bounds yield no runnable range.
+    if min_rank > max_rank {
+        return None;
+    }
+
+    let filtered: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|v| {
+            let r = rank(v);
+            r >= min_rank && r <= max_rank
+        })
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered)
+    }
+}
+
 /// Go crypto/tls `CurveID.String()` parity: rustls `NamedGroup` names differ
 /// for NIST curves, so map to the Go `CurveP*` spellings.
 fn go_key_exchange_name(group: rustls::NamedGroup) -> String {
@@ -913,5 +996,69 @@ mod tests {
         use base64::{engine::general_purpose, Engine as _};
         let decoded = general_purpose::STANDARD.decode(body.trim()).unwrap();
         assert_eq!(decoded, der);
+    }
+
+    #[test]
+    fn test_resolve_tls_versions_none() {
+        // No constraints → both TLS 1.2 and 1.3.
+        let v = resolve_tls_versions(None, None).unwrap();
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_tls_versions_min() {
+        // min tls13 → only TLS 1.3.
+        let v = resolve_tls_versions(Some("tls13"), None).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].version, rustls::ProtocolVersion::TLSv1_3);
+        // min tls12 → both.
+        let v = resolve_tls_versions(Some("tls12"), None).unwrap();
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_tls_versions_max() {
+        // max tls12 → only TLS 1.2.
+        let v = resolve_tls_versions(None, Some("tls12")).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].version, rustls::ProtocolVersion::TLSv1_2);
+    }
+
+    #[test]
+    fn test_resolve_tls_versions_unsupported() {
+        // tlsx supports sslv3/tls10/tls11 but rustls does not. A min bound of
+        // tls10 alone is satisfiable (1.2/1.3 are newer); capping the max
+        // below TLS 1.2 is not.
+        assert!(resolve_tls_versions(Some("sslv3"), Some("tls11")).is_none());
+        assert!(resolve_tls_versions(Some("tls10"), Some("tls11")).is_none());
+        assert_eq!(
+            resolve_tls_versions(Some("tls10"), None).map(|v| v.len()),
+            Some(2)
+        );
+        // Inverted bounds are an impossible range.
+        assert!(resolve_tls_versions(Some("tls13"), Some("tls12")).is_none());
+        // sslv3→tls13 is the full range: both 1.2 and 1.3 satisfy it.
+        assert_eq!(
+            resolve_tls_versions(Some("sslv3"), Some("tls13")).map(|v| v.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_cipher_restriction_filters_provider() {
+        // Filtering the default ring provider by a specific suite must retain
+        // exactly that suite.
+        let default = rustls::crypto::ring::default_provider();
+        assert!(!default.cipher_suites.is_empty());
+        let requested = "TLS_AES_128_GCM_SHA256";
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.cipher_suites.retain(|suite| {
+            go_cipher_name(suite.suite()).eq_ignore_ascii_case(requested)
+        });
+        assert_eq!(provider.cipher_suites.len(), 1);
+        assert_eq!(
+            go_cipher_name(provider.cipher_suites[0].suite()),
+            requested
+        );
     }
 }
