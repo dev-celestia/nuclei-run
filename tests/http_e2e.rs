@@ -1874,3 +1874,122 @@ http:
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_race_sends_concurrent_requests() {
+    use std::sync::atomic::AtomicUsize;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // Track the maximum number of simultaneously-open connections, proving the
+    // race requests are fired concurrently rather than sequentially.
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn({
+        let active = Arc::clone(&active);
+        let peak = Arc::clone(&peak);
+        let hits = Arc::clone(&hits);
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn({
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        let _ = read_http_request(&mut stream).await;
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = peak.fetch_max(now, Ordering::SeqCst);
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        // Hold the connection open so concurrency is observable.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let body = "RACE_VULN";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+    let engine = Arc::new(EngineRunner::new(
+        4,
+        5,
+        0,
+        0,
+        None,
+        &[],
+        false,
+        false,
+        30,
+        0,
+        None,
+    ));
+
+    // race_number: 5 → 5 identical concurrent requests.
+    let tmpl = r#"
+id: test-race
+info:
+  name: Race
+  author: test
+  severity: info
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/race"
+    race: true
+    race_number: 5
+    matchers:
+      - type: word
+        words:
+          - "RACE_VULN"
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let template_path = dir.path().join("t.yaml");
+    std::fs::write(&template_path, tmpl).unwrap();
+    let loaded = yaml_loader::load_templates(
+        &template_path.to_string_lossy(),
+        &yaml_loader::TemplateFilter::default(),
+    );
+    assert_eq!(loaded.templates.len(), 1);
+    let template = Arc::new(loaded.templates.into_iter().next().unwrap());
+
+    let tasks = vec![ScanTask {
+        target,
+        template,
+    }];
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let collector = tokio::spawn(async move {
+        let mut findings = Vec::new();
+        while let Some(f) = rx.recv().await {
+            findings.push(f);
+        }
+        findings
+    });
+    engine.run(tasks, tx).await;
+    let findings = collector.await.unwrap();
+
+    // All 5 race requests should have been sent concurrently (peak >= 2 means
+    // at least two were in flight at once).
+    assert_eq!(hits.load(Ordering::SeqCst), 5, "expected 5 race requests");
+    assert!(
+        peak.load(Ordering::SeqCst) >= 2,
+        "race requests must overlap concurrently; peak = {}",
+        peak.load(Ordering::SeqCst)
+    );
+    assert_eq!(findings.len(), 5, "each race response that matched should emit");
+    assert!(findings.iter().all(|f| f.template_id == "test-race"));
+}

@@ -16,7 +16,7 @@ use crate::engine::ssl_client::SslClient;
 use crate::engine::websocket_client::WebSocketClient;
 use crate::engine::whois_client::WhoisClient;
 use crate::models::result::ScanFinding;
-use crate::models::template::{NucleiTemplate, TemplateExtractor};
+use crate::models::template::{HttpBlock, NucleiTemplate, TemplateExtractor};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -627,6 +627,147 @@ impl EngineRunner {
         }
     }
 
+    /// Send a single HTTP request for a block, handling host-error bookkeeping.
+    /// Returns `None` when the request failed (or the host was dropped).
+    async fn send_http_one(
+        &self,
+        http_block: &HttpBlock,
+        target: &str,
+        req_spec: &RequestSpec,
+    ) -> Option<HttpResponse> {
+        let policy = self.block_request_policy(http_block);
+        let outcome = match req_spec {
+            RequestSpec::Standard {
+                method,
+                url,
+                headers,
+                body,
+            } => self.client.send(method, url, headers, body, &policy).await.ok(),
+            RequestSpec::Raw(raw_content) => {
+                self.client.send_raw(raw_content, target, &policy).await.ok()
+            }
+        };
+        match outcome {
+            Some(r) => {
+                self.host_errors.record_success(target).await;
+                Some(r)
+            }
+            None => {
+                if self.host_errors.record_error(target).await {
+                    eprintln!("[WRN] Too many errors for host {} — dropping it", target);
+                }
+                None
+            }
+        }
+    }
+
+    /// Evaluate one HTTP response: run extractors, register OOB interactions,
+    /// and emit a finding when the block's matchers match. Returns `true` when
+    /// the caller should stop iterating (no matchers, or stop-at-first-match).
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_http_response(
+        &self,
+        http_block: &HttpBlock,
+        template: &NucleiTemplate,
+        target: &str,
+        extracted_vars: &mut HashMap<String, String>,
+        mut capture: Option<&mut RunCapture>,
+        req_spec: &RequestSpec,
+        response: &HttpResponse,
+        interactsh_urls: &[String],
+        result_tx: &mpsc::Sender<ScanFinding>,
+    ) -> bool {
+        let has_non_internal_matchers = http_block.matchers.iter().any(|m| !m.internal);
+
+        let new_extractions = ExtractorEngine::extract_all(&http_block.extractors, response);
+        if let Some(c) = capture.as_mut() {
+            capture_extract_names(c, &http_block.extractors, &new_extractions);
+        }
+        extracted_vars.extend(new_extractions);
+
+        // Register for OOB correlation when this request carried interactsh
+        // URLs; early interactions are processed at once.
+        if !interactsh_urls.is_empty() {
+            let matched_url = match req_spec {
+                RequestSpec::Standard { url, .. } => url.clone(),
+                RequestSpec::Raw(_) => target.to_string(),
+            };
+            self.register_interactsh_requests(
+                template,
+                http_block,
+                matched_url,
+                response,
+                interactsh_urls,
+                result_tx,
+            )
+            .await;
+        }
+
+        if http_block.matchers.is_empty() {
+            return true;
+        }
+
+        let eval_resp = EvaluatedResponse {
+            status: response.status,
+            headers: &response.headers_raw,
+            body: &response.body,
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            duration_secs: response.duration_secs,
+            // Extracted values are visible to DSL matchers, as Go merges them
+            // into the data map before operator execution.
+            named_parts: Some(extracted_vars),
+        };
+
+        let condition = http_block.matchers_condition.as_deref().unwrap_or("or");
+        let matchers = interpolate_matchers(&http_block.matchers, target, extracted_vars);
+        let is_match = MatcherEngine::evaluate_all(&matchers, condition, &eval_resp);
+
+        if is_match {
+            if let Some(c) = capture.as_mut() {
+                c.record_matcher(MatcherEngine::matched_matcher_name(
+                    &matchers,
+                    condition,
+                    &eval_resp,
+                ));
+            }
+            if has_non_internal_matchers {
+                let output_values =
+                    ExtractorEngine::extract_output_values(&http_block.extractors, response);
+
+                let matched_url = match req_spec {
+                    RequestSpec::Standard { url, .. } => url.clone(),
+                    RequestSpec::Raw(_) => target.to_string(),
+                };
+
+                let finding = ScanFinding {
+                    template_id: template.id.clone(),
+                    template_name: template.info.name.clone(),
+                    severity: template.info.severity.to_lowercase(),
+                    matched_url,
+                    matched_at: chrono::Utc::now().to_rfc3339(),
+                    extracted_results: output_values,
+                    protocol: "http".to_string(),
+                    matcher_name: MatcherEngine::matched_matcher_name(
+                        &matchers,
+                        condition,
+                        &eval_resp,
+                    ),
+                    tags: template.info.tags.clone(),
+                };
+
+                let _ = result_tx.send(finding).await;
+            }
+
+            if !has_non_internal_matchers || http_block.stop_at_first_match {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub async fn execute_http(
         &self,
         template: &NucleiTemplate,
@@ -660,9 +801,6 @@ impl EngineRunner {
                     });
                 }
             }
-
-            let has_matchers = !http_block.matchers.is_empty();
-            let has_non_internal_matchers = http_block.matchers.iter().any(|m| !m.internal);
 
             // Substitute interactsh markers and track generated URLs per request.
             let mut interactsh_urls_per_request: Vec<Vec<String>> =
@@ -713,139 +851,71 @@ impl EngineRunner {
                     continue;
                 }
 
-                self.request_counter.fetch_add(1, Ordering::Relaxed);
+                let race_n = if http_block.race {
+                    http_block.race_number.filter(|n| *n > 0).unwrap_or(1)
+                } else {
+                    1
+                };
 
-                let policy = self.block_request_policy(http_block);
-                let response: HttpResponse = match req_spec {
-                    RequestSpec::Standard {
-                        ref method,
-                        ref url,
-                        ref headers,
-                        ref body,
-                    } => match self.client.send(method, url, headers, body, &policy).await {
-                        Ok(r) => {
-                            self.host_errors.record_success(target).await;
-                            r
-                        }
-                        Err(_) => {
-                            if self.host_errors.record_error(target).await {
-                                eprintln!(
-                                    "[WRN] Too many errors for host {} — dropping it",
-                                    target
-                                );
-                            }
-                            continue;
-                        }
-                    },
-                    RequestSpec::Raw(ref raw_content) => {
-                        match self
-                            .client
-                            .send_raw(raw_content, target, &policy)
+                if race_n > 1 {
+                    // Race condition testing: fire `race_n` identical requests
+                    // concurrently (Go `executeRaceRequest`), then evaluate the
+                    // responses. Only the requests are concurrent — evaluation
+                    // is sequential to keep variable capture deterministic.
+                    let interactsh_urls = interactsh_urls_per_request[req_index].clone();
+                    for _ in 0..race_n {
+                        self.request_counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let futures: Vec<_> = (0..race_n)
+                        .map(|_| self.send_http_one(http_block, target, &req_spec))
+                        .collect();
+                    let responses: Vec<Option<HttpResponse>> =
+                        futures_util::future::join_all(futures).await;
+
+                    let mut stop = false;
+                    for response in responses.into_iter().flatten() {
+                        if self
+                            .evaluate_http_response(
+                                http_block,
+                                template,
+                                target,
+                                extracted_vars,
+                                capture.as_deref_mut(),
+                                &req_spec,
+                                &response,
+                                &interactsh_urls,
+                                result_tx,
+                            )
                             .await
                         {
-                            Ok(r) => {
-                                self.host_errors.record_success(target).await;
-                                r
-                            }
-                            Err(_) => {
-                                if self.host_errors.record_error(target).await {
-                                    eprintln!(
-                                        "[WRN] Too many errors for host {} — dropping it",
-                                        target
-                                    );
-                                }
-                                continue;
-                            }
+                            stop = true;
+                            break;
                         }
                     }
-                };
-
-                let new_extractions =
-                    ExtractorEngine::extract_all(&http_block.extractors, &response);
-                if let Some(c) = capture.as_deref_mut() {
-                    capture_extract_names(c, &http_block.extractors, &new_extractions);
-                }
-                extracted_vars.extend(new_extractions);
-
-                // Register for OOB correlation when this request carried
-                // interactsh URLs; early interactions are processed at once.
-                if !interactsh_urls_per_request[req_index].is_empty() {
-                    let matched_url = match &req_spec {
-                        RequestSpec::Standard { url, .. } => url.clone(),
-                        RequestSpec::Raw(_) => target.to_string(),
-                    };
-                    self.register_interactsh_requests(
-                        template,
-                        http_block,
-                        matched_url,
-                        &response,
-                        &interactsh_urls_per_request[req_index],
-                        result_tx,
-                    )
-                    .await;
-                }
-
-                if !has_matchers {
-                    break;
-                }
-
-                let eval_resp = EvaluatedResponse {
-                    status: response.status,
-                    headers: &response.headers_raw,
-                    body: &response.body,
-                    interactsh_protocol: None,
-                    interactsh_request: None,
-                    interactsh_response: None,
-                    duration_secs: response.duration_secs,
-                    // Extracted values are visible to DSL matchers, as Go
-                    // merges them into the data map before operator execution.
-                    named_parts: Some(extracted_vars),
-                };
-
-                let condition = http_block.matchers_condition.as_deref().unwrap_or("or");
-                let matchers = interpolate_matchers(&http_block.matchers, target, extracted_vars);
-                let is_match = MatcherEngine::evaluate_all(&matchers, condition, &eval_resp);
-
-                if is_match {
-                    if let Some(c) = capture.as_deref_mut() {
-                        c.record_matcher(MatcherEngine::matched_matcher_name(
-                            &matchers,
-                            condition,
-                            &eval_resp,
-                        ));
-                    }
-                    if has_non_internal_matchers {
-                        let output_values = ExtractorEngine::extract_output_values(
-                            &http_block.extractors,
-                            &response,
-                        );
-
-                        let matched_url = match &req_spec {
-                            RequestSpec::Standard { url, .. } => url.clone(),
-                            RequestSpec::Raw(_) => target.to_string(),
-                        };
-
-                        let finding = ScanFinding {
-                            template_id: template.id.clone(),
-                            template_name: template.info.name.clone(),
-                            severity: template.info.severity.to_lowercase(),
-                            matched_url,
-                            matched_at: chrono::Utc::now().to_rfc3339(),
-                            extracted_results: output_values,
-                            protocol: "http".to_string(),
-                            matcher_name: MatcherEngine::matched_matcher_name(
-                                &matchers,
-                                condition,
-                                &eval_resp,
-                            ),
-                            tags: template.info.tags.clone(),
-                        };
-
-                        let _ = result_tx.send(finding).await;
-                    }
-
-                    if !has_non_internal_matchers || http_block.stop_at_first_match {
+                    if stop {
                         break;
+                    }
+                } else {
+                    self.request_counter.fetch_add(1, Ordering::Relaxed);
+                    if let Some(response) =
+                        self.send_http_one(http_block, target, &req_spec).await
+                    {
+                        if self
+                            .evaluate_http_response(
+                                http_block,
+                                template,
+                                target,
+                                extracted_vars,
+                                capture.as_deref_mut(),
+                                &req_spec,
+                                &response,
+                                &interactsh_urls_per_request[req_index],
+                                result_tx,
+                            )
+                            .await
+                        {
+                            break;
+                        }
                     }
                 }
             }
