@@ -19,6 +19,7 @@ pub enum FlowNode {
     Network(usize),
     Ssl(usize),
     Code(usize),
+    Javascript(usize),
     Bool(bool),
     Not(Box<FlowNode>),
     And(Box<FlowNode>, Box<FlowNode>),
@@ -100,7 +101,7 @@ fn tokenize(input: &str) -> Option<Vec<Token>> {
                 match ident.as_str() {
                     "true" => tokens.push(Token::Bool(true)),
                     "false" => tokens.push(Token::Bool(false)),
-                    "http" | "dns" | "network" | "tcp" | "ssl" | "code" => {
+                    "http" | "dns" | "network" | "tcp" | "ssl" | "code" | "javascript" => {
                         // Expect `(N)` with a 1-based index.
                         if chars.get(i) != Some(&'(') {
                             return None;
@@ -197,6 +198,7 @@ impl Parser {
                 "network" | "tcp" => FlowNode::Network(idx),
                 "ssl" => FlowNode::Ssl(idx),
                 "code" => FlowNode::Code(idx),
+                "javascript" => FlowNode::Javascript(idx),
                 _ => return None,
             }),
             Token::Bool(b) => Some(FlowNode::Bool(b)),
@@ -259,9 +261,21 @@ mod tests {
     fn test_reject_unsupported_constructs() {
         assert!(parse_flow("iterate(template.endpoints)").is_none());
         assert!(parse_flow("set(\"a\", 1)").is_none());
-        assert!(parse_flow("javascript() && http(1)").is_none());
         assert!(parse_flow("http(0)").is_none());
         assert!(parse_flow("status_code == 200").is_none());
         assert!(parse_flow("let x = http(1)").is_none());
+        assert!(parse_flow("javascript()").is_none());
+    }
+
+    #[test]
+    fn test_parse_javascript() {
+        let node = parse_flow("javascript(1) && http(1)").unwrap();
+        assert_eq!(
+            node,
+            FlowNode::And(
+                Box::new(FlowNode::Javascript(0)),
+                Box::new(FlowNode::Http(0))
+            )
+        );
     }
 }

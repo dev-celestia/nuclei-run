@@ -169,6 +169,13 @@ impl EngineRunner {
                     Some(block) => self.flow_code_block(block, target, ctx).await,
                     None => false,
                 },
+                FlowNode::Javascript(i) => match template.javascript.get(*i) {
+                    Some(block) => {
+                        self.flow_javascript_block(block, target, extracted_vars, ctx)
+                            .await
+                    }
+                    None => false,
+                },
             }
         })
     }
@@ -568,6 +575,57 @@ impl EngineRunner {
                     condition,
                     &eval_resp,
                 );
+            }
+        }
+        matched
+    }
+
+    /// Execute one javascript block referenced by a flow and report whether it
+    /// matched. A JS block whose pre-condition is unmet never matches; with no
+    /// matchers it matches when it executed (precondition met), mirroring Go's
+    /// flow semantics where a request's boolean result is whether a matcher hit.
+    async fn flow_javascript_block(
+        &self,
+        block: &crate::models::template::JavaScriptBlock,
+        target: &str,
+        extracted_vars: &mut HashMap<String, String>,
+        ctx: &mut FlowMatchContext,
+    ) -> bool {
+        self.request_counter.fetch_add(1, Ordering::Relaxed);
+        let Ok(js_resp) = crate::engine::js_client::JavaScriptClient::execute(block, target).await
+        else {
+            return false;
+        };
+        if !js_resp.precondition_met {
+            return false;
+        }
+        extracted_vars.insert("javascript_response".to_string(), js_resp.output.clone());
+
+        if block.matchers.is_empty() {
+            ctx.matched_url = Some(target.to_string());
+            ctx.protocol = "javascript".to_string();
+            return true;
+        }
+
+        let eval_resp = EvaluatedResponse {
+            status: 0,
+            headers: "",
+            body: &js_resp.output,
+            interactsh_protocol: None,
+            interactsh_request: None,
+            interactsh_response: None,
+            duration_secs: 0.0,
+            named_parts: None,
+        };
+        let condition = block.matchers_condition.as_deref().unwrap_or("or");
+        let matched = MatcherEngine::evaluate_all(&block.matchers, condition, &eval_resp);
+        if matched {
+            ctx.matched_url = Some(target.to_string());
+            ctx.extracted = vec![js_resp.output.clone()];
+            ctx.protocol = "javascript".to_string();
+            if ctx.matcher_name.is_none() {
+                ctx.matcher_name =
+                    MatcherEngine::matched_matcher_name(&block.matchers, condition, &eval_resp);
             }
         }
         matched

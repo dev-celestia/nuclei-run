@@ -2098,3 +2098,146 @@ http:
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].matcher_name, None, "unnamed matcher → None");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_flow_javascript_gates_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = read_http_request(&mut stream).await;
+                let body = "FLOW_HTTP_HIT";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+    let engine = Arc::new(EngineRunner::new(
+        2, 5, 0, 0, None, &[], false, false, 30, 0, None,
+    ));
+
+    // The JS block returns "JS_READY" (matching via its word matcher), and
+    // `javascript(1) && http(1)` means the HTTP block only runs if the JS
+    // block matched. The HTTP matcher confirms the flow chained through.
+    let tmpl = r#"
+id: test-flow-javascript
+info:
+  name: Flow Javascript
+  author: test
+  severity: info
+javascript:
+  - code: |
+      const out = "JS_READY";
+      out;
+    matchers:
+      - type: word
+        words:
+          - "JS_READY"
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/flow"
+    matchers:
+      - type: word
+        words:
+          - "FLOW_HTTP_HIT"
+flow: javascript(1) && http(1)
+"#;
+
+    let findings = run_template(engine, tmpl, &target).await;
+    assert_eq!(
+        findings.len(),
+        1,
+        "JS flow match must gate the HTTP block through to a finding"
+    );
+    assert_eq!(findings[0].template_id, "test-flow-javascript");
+    assert_eq!(
+        findings[0].protocol, "http",
+        "the emitted finding comes from the http block"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_flow_javascript_unmet_precondition_skips_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn({
+        let hits = Arc::clone(&hits);
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn({
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = read_http_request(&mut stream).await;
+                        let body = "FLOW_HTTP_HIT";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+    let engine = Arc::new(EngineRunner::new(
+        2, 5, 0, 0, None, &[], false, false, 30, 0, None,
+    ));
+
+    // The JS pre-condition is false, so the JS block does not match; the HTTP
+    // block must NOT run (short-circuit on &&).
+    let tmpl = r#"
+id: test-flow-js-precond
+info:
+  name: Flow JS Precondition
+  author: test
+  severity: info
+javascript:
+  - code: |
+      "unused";
+    pre-condition: "false"
+    matchers:
+      - type: word
+        words:
+          - "JS_READY"
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/flow"
+    matchers:
+      - type: word
+        words:
+          - "FLOW_HTTP_HIT"
+flow: javascript(1) && http(1)
+"#;
+
+    let findings = run_template(engine, tmpl, &target).await;
+    assert_eq!(findings.len(), 0, "no finding when JS precondition unmet");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "http block must be skipped when javascript() returns false"
+    );
+}
