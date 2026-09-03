@@ -79,6 +79,11 @@ async fn test_network_duration_dsl_matcher() {
     // Both matchers must hold: the DSL duration check AND the response body.
     // matchers-condition: and ensures a broken (always-zero) duration cannot
     // hide behind the word matcher.
+    //
+    // Note: the input step has NO `read`, so the server's "PONG" reply (sent
+    // after the 1500ms delay) is consumed by the final read and lands in the
+    // `data` match part. An input `read` would consume it as an interim value
+    // instead (Go `request.go` input-read semantics), leaving `data` empty.
     let tmpl_match = r#"
 id: test-network-duration-match
 info:
@@ -88,7 +93,6 @@ info:
 network:
   - inputs:
       - data: "PING\r\n"
-        read: 1024
     matchers-condition: and
     matchers:
       - type: dsl
@@ -116,7 +120,6 @@ info:
 network:
   - inputs:
       - data: "PING\r\n"
-        read: 1024
     matchers:
       - type: dsl
         dsl:
