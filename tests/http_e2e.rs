@@ -1993,3 +1993,108 @@ http:
     assert_eq!(findings.len(), 5, "each race response that matched should emit");
     assert!(findings.iter().all(|f| f.template_id == "test-race"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_matcher_name_populated_in_finding() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = read_http_request(&mut stream).await;
+                let body = "PWNED";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+    let engine = Arc::new(EngineRunner::new(
+        2, 5, 0, 0, None, &[], false, false, 30, 0, None,
+    ));
+
+    let tmpl = r#"
+id: test-matcher-name
+info:
+  name: Matcher Name
+  author: test
+  severity: info
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/pwned"
+    matchers:
+      - type: word
+        name: pwned-check
+        words:
+          - "PWNED"
+"#;
+
+    let findings = run_template(engine, tmpl, &target).await;
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        findings[0].matcher_name.as_deref(),
+        Some("pwned-check"),
+        "finding must carry the named matcher"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_matcher_name_none_when_unnamed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = read_http_request(&mut stream).await;
+                let body = "PWNED";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+    let engine = Arc::new(EngineRunner::new(
+        2, 5, 0, 0, None, &[], false, false, 30, 0, None,
+    ));
+
+    let tmpl = r#"
+id: test-matcher-unnamed
+info:
+  name: Unnamed Matcher
+  author: test
+  severity: info
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/pwned"
+    matchers:
+      - type: word
+        words:
+          - "PWNED"
+"#;
+
+    let findings = run_template(engine, tmpl, &target).await;
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].matcher_name, None, "unnamed matcher → None");
+}

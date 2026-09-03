@@ -20,6 +20,8 @@ pub struct FlowMatchContext {
     pub matched_url: Option<String>,
     pub extracted: Vec<String>,
     pub protocol: String,
+    /// Name of the matcher that produced the match (first one found).
+    pub matcher_name: Option<String>,
 }
 
 impl EngineRunner {
@@ -36,6 +38,7 @@ impl EngineRunner {
             matched_url: None,
             extracted: Vec::new(),
             protocol: "http".to_string(),
+            matcher_name: None,
         };
 
         let matched = self
@@ -53,7 +56,7 @@ impl EngineRunner {
             matched_at: chrono::Utc::now().to_rfc3339(),
             extracted_results: ctx.extracted,
             protocol: ctx.protocol,
-            matcher_name: None,
+            matcher_name: ctx.matcher_name.clone(),
             tags: template.info.tags.clone(),
         };
         let _ = result_tx.send(finding).await;
@@ -75,6 +78,7 @@ impl EngineRunner {
             matched_url: None,
             extracted: Vec::new(),
             protocol: "http".to_string(),
+            matcher_name: None,
         };
 
         let matched = self
@@ -94,7 +98,7 @@ impl EngineRunner {
             matched_at: chrono::Utc::now().to_rfc3339(),
             extracted_results: ctx.extracted,
             protocol: ctx.protocol,
-            matcher_name: None,
+            matcher_name: ctx.matcher_name.clone(),
             tags: template.info.tags.clone(),
         };
         let _ = result_tx.send(finding).await;
@@ -311,6 +315,10 @@ impl EngineRunner {
             let matchers = interpolate_matchers(&block.matchers, target, extracted_vars);
             if MatcherEngine::evaluate_all(&matchers, condition, &eval_resp) {
                 matched_any = true;
+                if ctx.matcher_name.is_none() {
+                    ctx.matcher_name =
+                        MatcherEngine::matched_matcher_name(&matchers, condition, &eval_resp);
+                }
                 ctx.matched_url = Some(match &req_spec {
                     RequestSpec::Standard { url, .. } => url.clone(),
                     RequestSpec::Raw(_) => target.to_string(),
@@ -384,6 +392,10 @@ impl EngineRunner {
                 duration_secs,
             );
             ctx.protocol = "dns".to_string();
+            if ctx.matcher_name.is_none() {
+                ctx.matcher_name =
+                    MatcherEngine::matched_matcher_name(&matchers, condition, &eval_resp);
+            }
         }
         matched
     }
@@ -444,6 +456,10 @@ impl EngineRunner {
                 duration_secs,
             );
             ctx.protocol = "network".to_string();
+            if ctx.matcher_name.is_none() {
+                ctx.matcher_name =
+                    MatcherEngine::matched_matcher_name(&matchers, condition, &eval_resp);
+            }
         }
         matched
     }
@@ -509,6 +525,10 @@ impl EngineRunner {
                 duration_secs,
             );
             ctx.protocol = "ssl".to_string();
+            if ctx.matcher_name.is_none() {
+                ctx.matcher_name =
+                    MatcherEngine::matched_matcher_name(&matchers, condition, &eval_resp);
+            }
         }
         matched
     }
@@ -542,6 +562,13 @@ impl EngineRunner {
             ctx.matched_url = Some(target.to_string());
             ctx.extracted = vec![code_resp.stdout.clone()];
             ctx.protocol = "code".to_string();
+            if ctx.matcher_name.is_none() {
+                ctx.matcher_name = MatcherEngine::matched_matcher_name(
+                    &block.matchers,
+                    condition,
+                    &eval_resp,
+                );
+            }
         }
         matched
     }

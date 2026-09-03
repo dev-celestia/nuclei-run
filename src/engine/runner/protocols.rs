@@ -119,7 +119,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: output_values,
                         protocol: "dns".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -205,7 +209,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: output_values,
                         protocol: "network".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -293,7 +301,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: output_values,
                         protocol: "ssl".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -346,7 +358,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: vec![],
                         protocol: "whois".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &whois_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -396,7 +412,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: vec![],
                         protocol: "file".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &file_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -449,7 +469,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: vec![code_resp.stdout],
                         protocol: "code".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &code_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -501,7 +525,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: ws_resp.responses,
                         protocol: "websocket".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &ws_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -558,7 +586,11 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: vec![],
                         protocol: "headless".to_string(),
-                        matcher_name: None,
+                        matcher_name: MatcherEngine::matched_matcher_name(
+                            &headless_block.matchers,
+                            condition,
+                            &eval_resp,
+                        ),
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
@@ -610,6 +642,13 @@ impl EngineRunner {
                             &eval_resp,
                         ));
                     }
+                    // Compute the matcher name before moving `js_resp.output` into
+                    // the finding (eval_resp borrows it for DSL matching).
+                    let matcher_name = MatcherEngine::matched_matcher_name(
+                        &js_block.matchers,
+                        condition,
+                        &eval_resp,
+                    );
                     let finding = ScanFinding {
                         template_id: template.id.clone(),
                         template_name: template.info.name.clone(),
@@ -618,7 +657,7 @@ impl EngineRunner {
                         matched_at: chrono::Utc::now().to_rfc3339(),
                         extracted_results: vec![js_resp.output],
                         protocol: "javascript".to_string(),
-                        matcher_name: None,
+                        matcher_name,
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
