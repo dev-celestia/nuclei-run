@@ -668,7 +668,7 @@ impl EngineRunner {
 
     /// Send a single HTTP request for a block, handling host-error bookkeeping.
     /// Returns `None` when the request failed (or the host was dropped).
-    async fn send_http_one(
+    pub(super) async fn send_http_one(
         &self,
         http_block: &HttpBlock,
         target: &str,

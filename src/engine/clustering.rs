@@ -2,16 +2,12 @@ use crate::models::template::NucleiTemplate;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A clustered request unit combining multiple templates that share identical HTTP paths/methods.
+/// A clustered request unit combining multiple templates that share identical
+/// HTTP paths/methods. All templates in the group hit the same request; the
+/// response is fetched once and each template's matchers run against it.
 #[derive(Debug, Clone)]
 pub struct ClusteredTask {
-    #[allow(dead_code)]
     pub target: String,
-    #[allow(dead_code)]
-    pub path: String,
-    #[allow(dead_code)]
-    pub method: String,
-    #[allow(dead_code)]
     pub templates: Vec<Arc<NucleiTemplate>>,
 }
 
@@ -19,33 +15,61 @@ pub struct RequestClusterer;
 
 impl RequestClusterer {
     /// Group scan tasks into clustered requests where possible.
+    ///
+    /// Mirrors Go's `Cluster` (`pkg/templates/cluster.go:46`): a template is
+    /// clusterable only when it has exactly one HTTP request with a single
+    /// path and no raw body/headers. Templates that cannot be clustered (flow,
+    /// multi-block, multi-path, raw) are emitted as singletons.
     pub fn cluster(
         targets: &[String],
         templates: &[Arc<NucleiTemplate>],
     ) -> Vec<ClusteredTask> {
-        let mut cluster_map: HashMap<(String, String, String), Vec<Arc<NucleiTemplate>>> = HashMap::new();
+        let mut cluster_map: HashMap<(String, String, String), Vec<Arc<NucleiTemplate>>> =
+            HashMap::new();
+        let mut singletons: Vec<ClusteredTask> = Vec::new();
 
         for target in targets {
             for template in templates {
-                if template.http.len() == 1 && template.http[0].raw.is_empty() && template.http[0].path.len() == 1 {
-                    let method = template.http[0].method.as_deref().unwrap_or("GET").to_uppercase();
+                if is_clusterable_http(template) {
+                    let method = template.http[0]
+                        .method
+                        .as_deref()
+                        .unwrap_or("GET")
+                        .to_uppercase();
                     let path = template.http[0].path[0].clone();
-                    let key = (target.clone(), method, path);
+                    let key = (target.clone(), method.clone(), path.clone());
                     cluster_map.entry(key).or_default().push(Arc::clone(template));
+                } else {
+                    singletons.push(ClusteredTask {
+                        target: target.clone(),
+                        templates: vec![Arc::clone(template)],
+                    });
                 }
             }
         }
 
-        cluster_map
+        let mut out: Vec<ClusteredTask> = cluster_map
             .into_iter()
-            .map(|((target, method, path), tmpls)| ClusteredTask {
+            .map(|((target, _method, _path), tmpls)| ClusteredTask {
                 target,
-                method,
-                path,
                 templates: tmpls,
             })
-            .collect()
+            .collect();
+        out.extend(singletons);
+        out
     }
+}
+
+/// A template is clusterable when it has exactly one HTTP block with a single
+/// path, no raw request, and no body — the request is fully shared.
+fn is_clusterable_http(template: &NucleiTemplate) -> bool {
+    template.flow.is_none()
+        && template.http.len() == 1
+        && template.http[0].raw.is_empty()
+        && template.http[0].path.len() == 1
+        && template.http[0].body.is_none()
+        && template.http[0].headers.is_empty()
+        && template.http[0].extractors.is_empty()
 }
 
 #[cfg(test)]

@@ -2241,3 +2241,124 @@ flow: javascript(1) && http(1)
         "http block must be skipped when javascript() returns false"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cluster_requests_single_http_fetch() {
+    use std::sync::atomic::AtomicUsize;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn({
+        let hits = Arc::clone(&hits);
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn({
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = read_http_request(&mut stream).await;
+                        let body = "CLUSTER_BODY";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+    let engine = Arc::new(EngineRunner::new(
+        2, 5, 0, 0, None, &[], false, false, 30, 0, None,
+    ));
+
+    // Two templates with identical single-path, no-body, no-headers, no-raw,
+    // no-extractors → clusterable. The server should see exactly 1 request.
+    let tmpl_a = r#"
+id: cluster-a
+info:
+  name: Cluster A
+  author: test
+  severity: info
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/shared"
+    matchers:
+      - type: word
+        words:
+          - "CLUSTER_BODY"
+"#;
+    let tmpl_b = r#"
+id: cluster-b
+info:
+  name: Cluster B
+  author: test
+  severity: info
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/shared"
+    matchers:
+      - type: word
+        words:
+          - "CLUSTER_BODY"
+"#;
+
+    let loaded_a = {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.yaml");
+        std::fs::write(&path, tmpl_a).unwrap();
+        yaml_loader::load_templates(&path.to_string_lossy(), &yaml_loader::TemplateFilter::default())
+    };
+    let loaded_b = {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.yaml");
+        std::fs::write(&path, tmpl_b).unwrap();
+        yaml_loader::load_templates(&path.to_string_lossy(), &yaml_loader::TemplateFilter::default())
+    };
+    assert_eq!(loaded_a.templates.len(), 1);
+    assert_eq!(loaded_b.templates.len(), 1);
+    let t_a = Arc::new(loaded_a.templates.into_iter().next().unwrap());
+    let t_b = Arc::new(loaded_b.templates.into_iter().next().unwrap());
+
+    // Build a cluster.
+    let cluster = nuclei_run::engine::clustering::RequestClusterer::cluster(
+        &[target],
+        &[t_a, t_b],
+    );
+    // With clustering enabled, there should be 1 cluster with both templates.
+    assert_eq!(cluster.len(), 1);
+    assert_eq!(cluster[0].templates.len(), 2);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let collector = tokio::spawn(async move {
+        let mut findings = Vec::new();
+        while let Some(f) = rx.recv().await {
+            findings.push(f);
+        }
+        findings
+    });
+    engine.run_clustered(cluster, tx).await;
+    let findings = collector.await.unwrap();
+
+    // Both templates matched → 2 findings, but only 1 HTTP request was sent.
+    assert_eq!(findings.len(), 2);
+    let ids: Vec<&str> = findings.iter().map(|f| f.template_id.as_str()).collect();
+    assert!(ids.contains(&"cluster-a"));
+    assert!(ids.contains(&"cluster-b"));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "clustered execution must send exactly 1 HTTP request for 2 templates"
+    );
+}

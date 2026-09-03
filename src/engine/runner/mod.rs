@@ -279,6 +279,248 @@ impl EngineRunner {
         }
     }
 
+    /// Run the clustered scan pipeline: for each cluster, send one HTTP request
+    /// and evaluate every template in the cluster against the shared response.
+    /// This is Go's `ClusterExecuter.Execute` equivalent.
+    pub async fn run_clustered(
+        self: Arc<Self>,
+        clusters: Vec<crate::engine::clustering::ClusteredTask>,
+        finding_tx: mpsc::Sender<ScanFinding>,
+    ) {
+        // Start the Interactsh poller if OOB support is enabled.
+        let poller_stop = if let Some(ref interactsh) = self.interactsh {
+            match interactsh.register().await {
+                Ok(()) => {
+                    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+                    let poller = Arc::clone(interactsh);
+                    let tx = finding_tx.clone();
+                    tokio::spawn(async move {
+                        poller.poll_loop(tx, stop_rx, INTERACTSH_POLL_SECS).await;
+                    });
+                    Some(stop_tx)
+                }
+                Err(e) => {
+                    eprintln!("[WRN] Interactsh registration failed: {} (OOB disabled)", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Set up rate limiter.
+        let rate_limiter = if self.rate_limit_rps > 0 {
+            let quota = Quota::per_second(
+                NonZeroU32::new(self.rate_limit_rps).unwrap_or(NonZeroU32::new(150).unwrap()),
+            );
+            Some(Arc::new(RateLimiter::direct(quota)))
+        } else {
+            None
+        };
+
+        let (task_tx, task_rx) =
+            async_channel::bounded::<crate::engine::clustering::ClusteredTask>(self.concurrency * 4);
+
+        let mut worker_handles = Vec::with_capacity(self.concurrency);
+        for _ in 0..self.concurrency {
+            let worker_self = Arc::clone(&self);
+            let worker_rx = task_rx.clone();
+            let worker_tx = finding_tx.clone();
+            let rl = rate_limiter.clone();
+            let handle = tokio::spawn(async move {
+                while let Ok(cluster) = worker_rx.recv().await {
+                    if worker_self.is_cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(ref limiter) = rl {
+                        limiter.until_ready().await;
+                    }
+                    worker_self.execute_clustered(cluster, &worker_tx).await;
+                }
+            });
+            worker_handles.push(handle);
+        }
+        drop(task_rx);
+
+        let is_cancelled = Arc::clone(&self.is_cancelled);
+        tokio::spawn(async move {
+            for cluster in clusters {
+                if is_cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                if task_tx.send(cluster).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        for handle in worker_handles {
+            let _ = handle.await;
+        }
+
+        // Shutdown the Interactsh poller.
+        if let Some(stop_tx) = poller_stop {
+            if let Some(ref interactsh) = self.interactsh {
+                if interactsh.generated_any() {
+                    tokio::time::sleep(std::time::Duration::from_secs(INTERACTSH_COOLDOWN_SECS))
+                        .await;
+                }
+            }
+            let _ = stop_tx.send(true);
+            if let Some(ref interactsh) = self.interactsh {
+                interactsh.deregister().await;
+            }
+        }
+    }
+
+    /// Execute a cluster: send the shared HTTP request once, then evaluate
+    /// every template in the cluster against the single response.
+    async fn execute_clustered(
+        &self,
+        cluster: crate::engine::clustering::ClusteredTask,
+        result_tx: &mpsc::Sender<ScanFinding>,
+    ) {
+        use crate::engine::extractor::ExtractorEngine;
+        use crate::engine::runner::helpers::{has_unresolved_variables, interpolate_matchers};
+        use crate::engine::matcher::{EvaluatedResponse, MatcherEngine};
+
+        if cluster.templates.is_empty() || self.is_cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let first_template = match cluster.templates.first() {
+            Some(t) => t,
+            None => return,
+        };
+        let http_block = match first_template.http.first() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Build the shared request using the existing helper, which handles
+        // path interpolation against {{BaseURL}} and the target URL.
+        let empty_vars = HashMap::new();
+        let specs = helpers::build_http_requests(http_block, &cluster.target, &empty_vars);
+        let req_spec = match specs.into_iter().next() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Check for unresolved variables.
+        match &req_spec {
+            helpers::RequestSpec::Standard { url, body, .. } => {
+                if has_unresolved_variables(url)
+                    || body.as_ref().map_or(false, |b| has_unresolved_variables(b))
+                {
+                    return;
+                }
+            }
+            helpers::RequestSpec::Raw(raw) => {
+                if has_unresolved_variables(raw) {
+                    return;
+                }
+            }
+        }
+
+        self.request_counter.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+
+        let Some(response) = self.send_http_one(http_block, &cluster.target, &req_spec).await
+        else {
+            // Request failed — record errors for all templates in the cluster.
+            for _t in &cluster.templates {
+                if self.host_errors.record_error(&cluster.target).await {
+                    eprintln!(
+                        "[WRN] Too many errors for host {} — dropping it",
+                        cluster.target
+                    );
+                }
+            }
+            return;
+        };
+
+        let _ = self.host_errors.record_success(&cluster.target).await;
+        let duration_secs = started.elapsed().as_secs_f64();
+
+        let matched_url = match &req_spec {
+            helpers::RequestSpec::Standard { url, .. } => url.clone(),
+            helpers::RequestSpec::Raw(_) => cluster.target.clone(),
+        };
+
+        // Evaluate each template's matchers against the shared response.
+        for template in &cluster.templates {
+            if self.is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if self.host_errors.is_dropped(&cluster.target).await {
+                return;
+            }
+
+            let Some(template_block) = template.http.first() else {
+                continue;
+            };
+
+            let mut extracted_vars: HashMap<String, String> = HashMap::new();
+
+            let new_extractions =
+                ExtractorEngine::extract_all(&template_block.extractors, &response);
+            extracted_vars.extend(new_extractions);
+
+            if template_block.matchers.is_empty() {
+                let finding = ScanFinding {
+                    template_id: template.id.clone(),
+                    template_name: template.info.name.clone(),
+                    severity: template.info.severity.to_lowercase(),
+                    matched_url: matched_url.clone(),
+                    matched_at: chrono::Utc::now().to_rfc3339(),
+                    extracted_results: vec![],
+                    protocol: "http".to_string(),
+                    matcher_name: None,
+                    tags: template.info.tags.clone(),
+                };
+                let _ = result_tx.send(finding).await;
+                continue;
+            }
+
+            let eval_resp = EvaluatedResponse {
+                status: response.status,
+                headers: &response.headers_raw,
+                body: &response.body,
+                interactsh_protocol: None,
+                interactsh_request: None,
+                interactsh_response: None,
+                duration_secs,
+                named_parts: Some(&extracted_vars),
+            };
+
+            let condition = template_block.matchers_condition.as_deref().unwrap_or("or");
+            let matchers =
+                interpolate_matchers(&template_block.matchers, &cluster.target, &extracted_vars);
+            let has_non_internal = template_block.matchers.iter().any(|m| !m.internal);
+
+            if has_non_internal && MatcherEngine::evaluate_all(&matchers, condition, &eval_resp) {
+                let output_values =
+                    ExtractorEngine::extract_output_values(&template_block.extractors, &response);
+                let finding = ScanFinding {
+                    template_id: template.id.clone(),
+                    template_name: template.info.name.clone(),
+                    severity: template.info.severity.to_lowercase(),
+                    matched_url: matched_url.clone(),
+                    matched_at: chrono::Utc::now().to_rfc3339(),
+                    extracted_results: output_values,
+                    protocol: "http".to_string(),
+                    matcher_name: MatcherEngine::matched_matcher_name(
+                        &matchers,
+                        condition,
+                        &eval_resp,
+                    ),
+                    tags: template.info.tags.clone(),
+                };
+                let _ = result_tx.send(finding).await;
+            }
+        }
+    }
+
     /// Execute a single scan task across all supported protocol blocks.
     pub async fn execute_task(&self, task: ScanTask, result_tx: &mpsc::Sender<ScanFinding>) {
         let target = &task.target;

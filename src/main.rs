@@ -401,13 +401,22 @@ async fn main() {
     let templates_arc: Vec<Arc<models::template::NucleiTemplate>> =
         all_templates.into_iter().map(Arc::new).collect();
 
-    // Check request clustering if enabled
-    if scan_config.cluster_requests {
-        let clusters = engine::clustering::RequestClusterer::cluster(&targets, &templates_arc);
-        if !scan_config.silent {
-            eprintln!("[INF] Clustered into {} distinct HTTP requests across {} templates", clusters.len(), templates_arc.len());
-        }
-    }
+    // Compute request clusters (mutual exclusion with per-template tasks).
+    let clustered_tasks: Vec<engine::clustering::ClusteredTask> =
+        if scan_config.cluster_requests {
+            let clusters =
+                engine::clustering::RequestClusterer::cluster(&targets, &templates_arc);
+            if !scan_config.silent {
+                eprintln!(
+                    "[INF] Clustered into {} distinct HTTP requests across {} templates",
+                    clusters.len(),
+                    templates_arc.len()
+                );
+            }
+            clusters
+        } else {
+            Vec::new()
+        };
 
     // Initialize the Interactsh OOB client when any template needs it.
     let interactsh_client = if templates_need_interactsh(&templates_arc) {
@@ -433,24 +442,28 @@ async fn main() {
         None
     };
 
-    let mut tasks = Vec::new();
-    for template in &templates_arc {
-        if yaml_loader::requires_self_contained(template) {
-            // Self-contained templates are not bound to targets: they run once
-            // with their own hardcoded URLs (Go: executeAllSelfContained).
-            tasks.push(ScanTask {
-                target: String::new(),
-                template: Arc::clone(template),
-            });
-        } else {
-            for target in &targets {
-                tasks.push(ScanTask {
-                    target: target.clone(),
+    // Build per-template tasks only when clustering is NOT active.
+    let tasks: Vec<ScanTask> = if scan_config.cluster_requests {
+        Vec::new()
+    } else {
+        let mut t = Vec::new();
+        for template in &templates_arc {
+            if yaml_loader::requires_self_contained(template) {
+                t.push(ScanTask {
+                    target: String::new(),
                     template: Arc::clone(template),
                 });
+            } else {
+                for target in &targets {
+                    t.push(ScanTask {
+                        target: target.clone(),
+                        template: Arc::clone(template),
+                    });
+                }
             }
         }
-    }
+        t
+    };
 
     // Create engine runner.
     let engine = Arc::new(
@@ -494,7 +507,11 @@ async fn main() {
     let engine_clone = Arc::clone(&engine);
 
     let scan_handle = tokio::spawn(async move {
-        engine_clone.run(tasks, finding_tx).await;
+        if !clustered_tasks.is_empty() {
+            engine_clone.run_clustered(clustered_tasks, finding_tx).await;
+        } else {
+            engine_clone.run(tasks, finding_tx).await;
+        }
     });
 
     // Collect and output findings as they arrive.
