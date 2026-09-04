@@ -716,23 +716,30 @@ impl EngineRunner {
         req_spec: &RequestSpec,
     ) -> Option<HttpResponse> {
         let policy = self.block_request_policy(http_block);
-        let outcome = match req_spec {
+        let outcome: Result<HttpResponse, String> = match req_spec {
             RequestSpec::Standard {
                 method,
                 url,
                 headers,
                 body,
-            } => self.client.send(method, url, headers, body, &policy).await.ok(),
+            } => self
+                .client
+                .send(method, url, headers, body, &policy)
+                .await
+                .map_err(|e| e.to_string()),
             RequestSpec::Raw(raw_content) => {
-                self.client.send_raw(raw_content, target, &policy).await.ok()
+                self.client.send_raw(raw_content, target, &policy).await
             }
         };
         match outcome {
-            Some(r) => {
+            Ok(r) => {
                 self.host_errors.record_success(target).await;
                 Some(r)
             }
-            None => {
+            Err(e) => {
+                if let Some(ref tx) = self.error_sender {
+                    let _ = tx.try_send((target.to_string(), e.clone()));
+                }
                 if self.host_errors.record_error(target).await {
                     eprintln!("[WRN] Too many errors for host {} — dropping it", target);
                 }

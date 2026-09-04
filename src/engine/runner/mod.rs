@@ -87,6 +87,8 @@ pub struct EngineRunner {
     pub stop_at_first_match: bool,
     /// Registry of loaded templates for resolving workflow step references.
     pub workflow_registry: Option<Arc<WorkflowTemplateRegistry>>,
+    /// Optional sender for reporting request/connection errors to UI or listeners.
+    pub error_sender: Option<mpsc::Sender<(String, String)>>,
 }
 
 impl EngineRunner {
@@ -120,7 +122,14 @@ impl EngineRunner {
             global_max_redirects: max_redirects,
             stop_at_first_match: false,
             workflow_registry: None,
+            error_sender: None,
         }
+    }
+
+    /// Provide an error sender to capture target request/connection failures.
+    pub fn with_error_sender(mut self, tx: mpsc::Sender<(String, String)>) -> Self {
+        self.error_sender = Some(tx);
+        self
     }
 
     /// Provide the registry of loaded templates so workflow steps can resolve

@@ -14,7 +14,10 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiScanConfig {
     pub targets: Vec<String>,
+    #[serde(default)]
     pub template_paths: Vec<String>,
+    #[serde(default)]
+    pub raw_templates: Vec<String>,
     pub concurrency: usize,
     pub rate_limit_rps: u32,
     pub timeout_seconds: u64,
@@ -126,12 +129,33 @@ impl UiScannerAdapter for NucleiUiEngine {
         let is_paused = Arc::clone(&self.is_paused);
         is_paused.store(false, Ordering::SeqCst);
 
-        // Load templates.
+        // Load templates from disk paths.
         let filter = crate::parser::yaml_loader::TemplateFilter::default();
         let mut templates = Vec::new();
         for path in &config.template_paths {
             let result = crate::parser::yaml_loader::load_templates(path, &filter);
             templates.extend(result.templates);
+        }
+
+        // Load templates from raw in-memory YAML strings.
+        for (idx, raw) in config.raw_templates.iter().enumerate() {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            match serde_yaml::from_str::<crate::models::template::NucleiTemplate>(raw) {
+                Ok(mut t) => {
+                    t.source_path = format!("memory://template-{}.yaml", idx + 1).into();
+                    templates.push(t);
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(ScannerEvent::ScanError {
+                            target: format!("memory-template-{}", idx + 1),
+                            message: format!("Failed to parse YAML template: {}", e),
+                        })
+                        .await;
+                }
+            }
         }
 
         let total_templates = templates.len();
@@ -161,37 +185,99 @@ impl UiScannerAdapter for NucleiUiEngine {
 
         let total_tasks = tasks.len();
 
+        // Create error reporting channel.
+        let (err_tx, mut err_rx) = mpsc::channel::<(String, String)>(500);
+
         // Create engine.
-        let engine = Arc::new(crate::engine::runner::EngineRunner::new(
-            config.concurrency,
-            config.timeout_seconds,
-            config.rate_limit_rps,
-            10,
-            None,
-            &[],
-            false,
-            false,
-            0,
-            1,
-            None,
-        ));
+        let engine = Arc::new(
+            crate::engine::runner::EngineRunner::new(
+                config.concurrency,
+                config.timeout_seconds,
+                config.rate_limit_rps,
+                10,
+                None,
+                &[],
+                false,
+                false,
+                50,
+                1,
+                None,
+            )
+            .with_error_sender(err_tx),
+        );
+
+        // Forward target connection / network errors to UI.
+        let event_tx_err = event_tx.clone();
+        tokio::spawn(async move {
+            let mut last_error_time = std::time::Instant::now();
+            let mut err_count = 0usize;
+            let mut last_msg = String::new();
+
+            while let Some((target, message)) = err_rx.recv().await {
+                err_count += 1;
+                let elapsed_ms = last_error_time.elapsed().as_millis();
+                // Send first 5 errors immediately, then rate-limit duplicates to 1/sec
+                if err_count <= 5 || elapsed_ms >= 1000 || message != last_msg {
+                    last_error_time = std::time::Instant::now();
+                    last_msg = message.clone();
+                    let _ = event_tx_err
+                        .send(ScannerEvent::ScanError { target, message })
+                        .await;
+                }
+            }
+        });
 
         // Create internal finding channel.
         let (finding_tx, mut finding_rx) = mpsc::channel(500);
 
-        // Start engine.
+        // Start engine in background task.
         let engine_clone = Arc::clone(&engine);
-        tokio::spawn(async move {
+        let scan_join_handle = tokio::spawn(async move {
             engine_clone.run(tasks, finding_tx).await;
         });
 
-        // Forward findings to UI event channel.
+        // Forward findings and progress to UI event channel.
         let _cancel_rx = cancel_rx;
+        let engine_for_progress = Arc::clone(&engine);
+        let event_tx_clone = event_tx.clone();
+
         tokio::spawn(async move {
             let start_time = std::time::Instant::now();
             let mut finding_count = 0usize;
-            let mut request_count = 0usize;
 
+            // Spawn background heartbeat ticker for continuous progress updates (every 250ms)
+            let is_paused_ticker = Arc::clone(&is_paused);
+            let engine_ticker = Arc::clone(&engine_for_progress);
+            let event_tx_ticker = event_tx_clone.clone();
+
+            let (ticker_stop_tx, mut ticker_stop_rx) = tokio::sync::watch::channel(false);
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(250));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if *ticker_stop_rx.borrow() {
+                                break;
+                            }
+                            if !is_paused_ticker.load(Ordering::SeqCst) {
+                                let completed = engine_ticker.request_count();
+                                let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+                                let _ = event_tx_ticker.send(ScannerEvent::ProgressUpdate {
+                                    completed_requests: completed.min(total_tasks),
+                                    total_requests: total_tasks,
+                                    rps: (completed as f64 / elapsed * 10.0).round() / 10.0,
+                                }).await;
+                            }
+                        }
+                        _ = ticker_stop_rx.changed() => {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Process discovered findings
             while let Some(finding) = finding_rx.recv().await {
                 // Handle pause.
                 while is_paused.load(Ordering::SeqCst) {
@@ -199,7 +285,6 @@ impl UiScannerAdapter for NucleiUiEngine {
                 }
 
                 finding_count += 1;
-                request_count += 1;
 
                 // Emit finding event.
                 let _ = event_tx
@@ -212,17 +297,24 @@ impl UiScannerAdapter for NucleiUiEngine {
                         extracted_results: finding.extracted_results,
                     }))
                     .await;
-
-                // Emit progress event.
-                let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
-                let _ = event_tx
-                    .send(ScannerEvent::ProgressUpdate {
-                        completed_requests: request_count,
-                        total_requests: total_tasks,
-                        rps: request_count as f64 / elapsed,
-                    })
-                    .await;
             }
+
+            // Wait for engine to finish all remaining tasks
+            let _ = scan_join_handle.await;
+
+            // Stop progress ticker
+            let _ = ticker_stop_tx.send(true);
+
+            // Final progress update
+            let final_completed = engine_for_progress.request_count().max(total_tasks);
+            let final_elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+            let _ = event_tx
+                .send(ScannerEvent::ProgressUpdate {
+                    completed_requests: total_tasks,
+                    total_requests: total_tasks,
+                    rps: (final_completed as f64 / final_elapsed * 10.0).round() / 10.0,
+                })
+                .await;
 
             // Emit completion event.
             let _ = event_tx

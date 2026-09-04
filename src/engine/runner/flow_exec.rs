@@ -256,7 +256,11 @@ impl EngineRunner {
                         self.host_errors.record_success(target).await;
                         r
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        if let Some(ref tx) = self.error_sender {
+                            let _ = tx.try_send((target.to_string(), err_msg));
+                        }
                         if self.host_errors.record_error(target).await {
                             eprintln!("[WRN] Too many errors for host {} — dropping it", target);
                         }
@@ -269,7 +273,10 @@ impl EngineRunner {
                             self.host_errors.record_success(target).await;
                             r
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            if let Some(ref tx) = self.error_sender {
+                                let _ = tx.try_send((target.to_string(), e));
+                            }
                             if self.host_errors.record_error(target).await {
                                 eprintln!("[WRN] Too many errors for host {} — dropping it", target);
                             }
