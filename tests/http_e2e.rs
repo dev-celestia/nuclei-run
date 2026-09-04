@@ -2362,3 +2362,172 @@ http:
         "clustered execution must send exactly 1 HTTP request for 2 templates"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_global_stop_at_first_match_skips_later_protocols() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let http_hits = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn({
+        let http_hits = Arc::clone(&http_hits);
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn({
+                    let http_hits = Arc::clone(&http_hits);
+                    async move {
+                        http_hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = read_http_request(&mut stream).await;
+                        let body = "HTTP_WOULD_MATCH";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        }
+    });
+
+    let target = format!("http://127.0.0.1:{}", port);
+
+    // A template with a network block that matches, followed by an HTTP block.
+    // With global stop-at-first-match, the network match must short-circuit and
+    // the HTTP block must NOT run.
+    let dir = tempfile::tempdir().unwrap();
+    let template_path = dir.path().join("template.yaml");
+    std::fs::write(
+        &template_path,
+        r#"
+id: test-global-spm
+info:
+  name: Global SPM
+  author: test
+  severity: info
+network:
+  - inputs:
+      - data: "PING\r\n"
+    matchers:
+      - type: word
+        words:
+          - "PONG"
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/spm"
+    matchers:
+      - type: word
+        words:
+          - "HTTP_WOULD_MATCH"
+"#,
+    )
+    .unwrap();
+    let loaded = yaml_loader::load_templates(
+        &template_path.to_string_lossy(),
+        &yaml_loader::TemplateFilter::default(),
+    );
+    assert_eq!(loaded.templates.len(), 1);
+    let template = Arc::new(loaded.templates.into_iter().next().unwrap());
+
+    let engine = Arc::new(EngineRunner::new(
+        2, 10, 0, 0, None, &[], false, false, 30, 0, None,
+    ).with_stop_at_first_match(true));
+
+    // The network block connects to 127.0.0.1:port and expects "PONG" after
+    // "PING". We can't easily stand up a raw TCP responder here that also
+    // serves HTTP on the same port, so we just assert the plumbing: the HTTP
+    // block is skipped entirely because network matched is short-circuited.
+    // Use a network matcher that always matches on the HTTP server's response
+    // is not possible; instead rely on the fact that with no network server
+    // the network block fails and does NOT stop, so HTTP still runs.
+    //
+    // To specifically test the stop behavior, we use a network target that
+    // echoes PONG. Start a small echo TCP server on a different port.
+    let net_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let net_port = net_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = net_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 128];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(b"PONG").await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    let net_target = format!("http://127.0.0.1:{}", net_port);
+
+    // Rewrite: use the net target for the network block by providing a host.
+    let template_path2 = dir.path().join("template2.yaml");
+    std::fs::write(
+        &template_path2,
+        format!(
+            r#"
+id: test-global-spm
+info:
+  name: Global SPM
+  author: test
+  severity: info
+network:
+  - host:
+      - "http://127.0.0.1:{}"
+    inputs:
+      - data: "PING\r\n"
+    matchers:
+      - type: word
+        words:
+          - "PONG"
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/spm"
+    matchers:
+      - type: word
+        words:
+          - "HTTP_WOULD_MATCH"
+"#,
+            net_port
+        ),
+    )
+    .unwrap();
+    let loaded2 = yaml_loader::load_templates(
+        &template_path2.to_string_lossy(),
+        &yaml_loader::TemplateFilter::default(),
+    );
+    assert_eq!(loaded2.templates.len(), 1);
+    let template2 = Arc::new(loaded2.templates.into_iter().next().unwrap());
+
+    let tasks = vec![ScanTask {
+        target,
+        template: template2,
+    }];
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let collector = tokio::spawn(async move {
+        let mut findings = Vec::new();
+        while let Some(f) = rx.recv().await {
+            findings.push(f);
+        }
+        findings
+    });
+    engine.run(tasks, tx).await;
+    let findings = collector.await.unwrap();
+
+    // Network matched → with global SPM, the HTTP block must not run.
+    assert_eq!(
+        http_hits.load(Ordering::SeqCst),
+        0,
+        "HTTP block must be skipped after network match with global SPM"
+    );
+    assert_eq!(findings.len(), 1, "only the network finding should be emitted");
+    assert_eq!(findings[0].protocol, "network");
+    assert_eq!(findings[0].template_id, "test-global-spm");
+}

@@ -118,6 +118,9 @@ pub struct ScanConfig {
     /// Deduplicate identical HTTP requests across templates.
     pub cluster_requests: bool,
 
+    /// Global `-spm`: stop at first match across all protocols.
+    pub stop_at_first_match: bool,
+
     /// Enable JSONL output format.
     pub jsonl: bool,
 

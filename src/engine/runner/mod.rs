@@ -83,6 +83,8 @@ pub struct EngineRunner {
     pub disable_redirects: bool,
     /// Global `-mr` / `--max-redirects` (overrides per-block caps when set).
     pub global_max_redirects: usize,
+    /// Global `-spm` / `--stop-at-first-match` flag.
+    pub stop_at_first_match: bool,
     /// Registry of loaded templates for resolving workflow step references.
     pub workflow_registry: Option<Arc<WorkflowTemplateRegistry>>,
 }
@@ -116,6 +118,7 @@ impl EngineRunner {
             follow_host_redirects: false,
             disable_redirects: false,
             global_max_redirects: max_redirects,
+            stop_at_first_match: false,
             workflow_registry: None,
         }
     }
@@ -137,6 +140,12 @@ impl EngineRunner {
         self.follow_redirects = follow_redirects;
         self.follow_host_redirects = follow_host_redirects;
         self.disable_redirects = disable_redirects;
+        self
+    }
+
+    /// Set the global stop-at-first-match flag (mirrors Go `-spm`).
+    pub fn with_stop_at_first_match(mut self, enabled: bool) -> Self {
+        self.stop_at_first_match = enabled;
         self
     }
 
@@ -611,45 +620,140 @@ impl EngineRunner {
         mut capture: Option<&mut RunCapture>,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
+        let mut spm_stop = false;
+
         // 1. DNS Protocol Execution
-        self.execute_dns(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_dns(
+            template,
+            target,
+            extracted_vars,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 2. Network / TCP Protocol Execution
-        self.execute_network(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_network(
+            template,
+            target,
+            extracted_vars,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 3. SSL / TLS Protocol Execution
-        self.execute_ssl(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_ssl(
+            template,
+            target,
+            extracted_vars,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 4. WHOIS Protocol Execution
-        self.execute_whois(template, target, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_whois(
+            template,
+            target,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 5. File Protocol Execution
-        self.execute_file(template, target, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_file(
+            template,
+            target,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 6. Code Execution Protocol
-        self.execute_code(template, target, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_code(
+            template,
+            target,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 7. WebSocket Protocol Execution
-        self.execute_websocket(template, target, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_websocket(
+            template,
+            target,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 8. Headless Browser Protocol Execution
-        self.execute_headless(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_headless(
+            template,
+            target,
+            extracted_vars,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 9. JavaScript Protocol Execution
-        self.execute_js(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_js(
+            template,
+            target,
+            extracted_vars,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
+        if spm_stop {
+            return;
+        }
 
         // 10. HTTP Request Blocks & Parameter Fuzzing
-        self.execute_http(template, target, extracted_vars, capture.as_deref_mut(), result_tx)
-            .await;
+        self.execute_http(
+            template,
+            target,
+            extracted_vars,
+            capture.as_deref_mut(),
+            &mut spm_stop,
+            result_tx,
+        )
+        .await;
     }
 
     /// Replace `{{interactsh-url}}` markers with freshly generated correlation

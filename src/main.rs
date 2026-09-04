@@ -183,6 +183,10 @@ struct Cli {
     #[arg(long = "cluster-requests")]
     pub cluster_requests: bool,
 
+    /// Stop at first match across all protocols
+    #[arg(long = "stop-at-first-match", alias = "spm")]
+    pub stop_at_first_match: bool,
+
     /// Enable JSON Lines output
     #[arg(long = "jsonl")]
     pub jsonl: bool,
@@ -485,6 +489,7 @@ async fn main() {
             scan_config.follow_host_redirects,
             scan_config.disable_redirects,
         )
+        .with_stop_at_first_match(scan_config.stop_at_first_match)
         .with_workflow_registry(Arc::new(
             engine::workflow::WorkflowTemplateRegistry::new(templates_arc.clone()),
         )),
@@ -743,6 +748,7 @@ fn build_config(cli: &Cli) -> ScanConfig {
         tracker_project: cli.tracker_project.clone(),
         tracker_url: cli.tracker_url.clone(),
         cluster_requests: cli.cluster_requests,
+        stop_at_first_match: cli.stop_at_first_match,
         jsonl: cli.jsonl,
         sarif: cli.sarif,
         silent: cli.silent,

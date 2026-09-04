@@ -48,10 +48,11 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for dns_block in &template.dns {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -127,6 +128,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -138,10 +143,11 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for net_block in &template.network {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -217,6 +223,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -228,10 +238,11 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for ssl_block in &template.ssl {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -309,6 +320,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -319,10 +334,11 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for whois_block in &template.whois {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -366,6 +382,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -376,10 +396,11 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for file_block in &template.file {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             let started = Instant::now();
@@ -420,6 +441,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -430,10 +455,11 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for code_block in &template.code {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -477,6 +503,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -487,10 +517,11 @@ impl EngineRunner {
         template: &NucleiTemplate,
         target: &str,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for ws_block in &template.websocket {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -533,6 +564,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -544,10 +579,11 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for headless_block in &template.headless {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             if !self.headless_enabled {
@@ -594,6 +630,10 @@ impl EngineRunner {
                         tags: template.info.tags.clone(),
                     };
                     let _ = result_tx.send(finding).await;
+                    if self.stop_at_first_match {
+                        *spm_stop = true;
+                        return;
+                    }
                 }
             }
         }
@@ -605,10 +645,11 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for js_block in &template.javascript {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
             self.request_counter.fetch_add(1, Ordering::Relaxed);
@@ -711,6 +752,7 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         req_spec: &RequestSpec,
         response: &HttpResponse,
         interactsh_urls: &[String],
@@ -799,7 +841,12 @@ impl EngineRunner {
                 let _ = result_tx.send(finding).await;
             }
 
-            if !has_non_internal_matchers || http_block.stop_at_first_match {
+            let should_stop =
+                !has_non_internal_matchers || http_block.stop_at_first_match || self.stop_at_first_match;
+            if should_stop {
+                if self.stop_at_first_match {
+                    *spm_stop = true;
+                }
                 return true;
             }
         }
@@ -813,10 +860,11 @@ impl EngineRunner {
         target: &str,
         extracted_vars: &mut HashMap<String, String>,
         mut capture: Option<&mut RunCapture>,
+        spm_stop: &mut bool,
         result_tx: &mpsc::Sender<ScanFinding>,
     ) {
         for http_block in &template.http {
-            if self.is_cancelled.load(Ordering::Relaxed) {
+            if self.is_cancelled.load(Ordering::Relaxed) || *spm_stop {
                 return;
             }
 
@@ -920,6 +968,7 @@ impl EngineRunner {
                                 target,
                                 extracted_vars,
                                 capture.as_deref_mut(),
+                                spm_stop,
                                 &req_spec,
                                 &response,
                                 &interactsh_urls,
@@ -946,6 +995,7 @@ impl EngineRunner {
                                 target,
                                 extracted_vars,
                                 capture.as_deref_mut(),
+                                spm_stop,
                                 &req_spec,
                                 &response,
                                 &interactsh_urls_per_request[req_index],
